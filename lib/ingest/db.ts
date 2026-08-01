@@ -15,9 +15,17 @@
  *
  * TLS note: pg treats `sslmode=require` in the URL as verify-full, which
  * rejects Supabase's chain. The URL's query string is stripped and TLS is
- * configured explicitly instead. Host note: use the DIRECT host
- * (db.<ref>.supabase.co:5432) — the Supavisor pooler rejects the custom role
- * ("tenant/user not found", observed 2026-08-01).
+ * configured explicitly instead.
+ *
+ * Host note (corrected 2026-08-01): the direct host (db.<ref>.supabase.co)
+ * is IPv6-ONLY — fine from IPv6 networks, unreachable from GitHub Actions
+ * runners (ENETUNREACH). CI must use the Supavisor pooler (IPv4) with the
+ * tenant-suffixed username (role.<project-ref>) at the project's ACTUAL
+ * pooler host — read it from the dashboard/Management API, never guess:
+ * this project is aws-1-us-east-1, and a wrong host (aws-0) fails with
+ * "Tenant or user not found", which was earlier misread as the pooler
+ * rejecting custom roles. Custom roles work through the pooler (verified
+ * 2026-08-01, session and transaction mode).
  *
  * Relative-import discipline: these modules are
  * reached from `npx tsx workers/...` where "@/" aliases don't apply.
