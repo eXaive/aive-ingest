@@ -1,0 +1,9 @@
+# Never commit credentials — the only secret this repo uses is
+# AIVE_INGEST_DATABASE_URL, which lives in GitHub Actions secrets (CI) or a
+# local .env file (dev). Both env file forms are ignored.
+.env
+.env.local
+.env.*.local
+
+node_modules/
+*.log

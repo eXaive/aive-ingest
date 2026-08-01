@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# npm SDK Packages Ingest — daily keyword scan of registry.npmjs.org
+# (keywords: sdk, client, api-client). A floor, not a census.
+#
+# Moved here from the private repo 2026-08-01; cadence unchanged (06:15 UTC).
+# Exits non-zero on ingest errors or a stale snapshot stream (in-worker
+# tripwire). Search-window truncation and scoped-package drops are logged and
+# recorded in scan_runs status — never silently capped. The red Actions run
+# IS the alert. No upstream API key.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
+# workflow holds a database credential and must not be reachable from forks.
+#
+# Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role —
+# six tables, no delete). Nothing else.
+# ═══════════════════════════════════════════════════════════════════════════
+name: npm SDK Packages Ingest
+
+on:
+  schedule:
+    - cron: '15 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: npm-sdk-packages-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm SDK packages scan
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+        run: npx tsx workers/ingest-npm-sdk-packages.ts

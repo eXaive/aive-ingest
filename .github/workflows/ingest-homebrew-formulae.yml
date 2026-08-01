@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Homebrew Formulae Ingest — daily full scan of formulae.brew.sh
+#
+# Moved here from the private repo 2026-08-01; cadence unchanged (05:45 UTC).
+# Exits non-zero on ingest errors or a stale snapshot stream (in-worker
+# tripwire). The red Actions run IS the alert. No upstream API key.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
+# workflow holds a database credential and must not be reachable from forks.
+#
+# Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role —
+# six tables, no delete). Nothing else.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Homebrew Formulae Ingest
+
+on:
+  schedule:
+    - cron: '45 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: homebrew-formulae-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run Homebrew formulae scan
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+        run: npx tsx workers/ingest-homebrew-formulae.ts

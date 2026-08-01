@@ -1,0 +1,503 @@
+/**
+ * MCP Registry Ingest Worker
+ *
+ * Pages GET https://registry.modelcontextprotocol.io/v0.1/servers — FULL scan
+ * every run (2026-07-23: the old ?updated_since incremental mode meant servers
+ * with no registry update were never returned, so their last_seen never
+ * advanced; a full scan makes last_seen a true "still listed" liveness marker
+ * for every server, every run). Snapshots remain write-on-change via the
+ * definition_hash comparison. Each run writes one scan_runs row
+ * (started_at / finished_at / pages_fetched / servers_returned / status).
+ *
+ * Actual API shape (confirmed from live registry 2026-06-15):
+ *   servers[i] = {
+ *     server: { name, title, description, version, packages?, remotes?, ... },
+ *     _meta:  { "io.modelcontextprotocol.registry/official": { status, updatedAt, isLatest, ... } }
+ *   }
+ *
+ * Batched write strategy (avoids per-row round-trips):
+ *   1. Filter to isLatest === true, with semver fallback for servers that have no true entry.
+ *   2. For each chunk of CHUNK_SIZE items:
+ *      a. Pre-fetch existing (name, id, definition_hash) in one IN query.
+ *      b. Bulk upsert the chunk (onConflict: 'name') — first_seen untouched via DB default.
+ *      c. Bulk insert snapshots only for new/changed hashes.
+ *   Result: ~3 × ceil(N / CHUNK_SIZE) DB calls instead of 3 × N.
+ *
+ * Run standalone: npx tsx --env-file=.env.local workers/ingest-mcp-registry.ts
+ */
+
+import { createHash }   from 'crypto';
+// Direct Postgres via the scoped aive_ingest role — no supabase-js, no
+// service key. logIngestionPg is the ingest-local ingestion_log writer; the
+// shared workers/logIngestion.ts (service-key client) is untouched for its
+// private-repo callers. See lib/ingest/db.ts.
+import { q, upsertRows, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
+import { hashCanonical } from '../lib/mcp/canonicalize';
+import { parseLimit } from "../lib/ingest/parseLimit";
+
+const REGISTRY_BASE = 'https://registry.modelcontextprotocol.io/v0.1';
+const PAGE_LIMIT    = 100;
+const CHUNK_SIZE    = 150;   // caps the step-4a IN-list URL (~6.6 KB at 150 × 40-char names, well under PostgREST's ~16 KB limit)
+const SOURCE_SLUG   = 'mcp-registry';
+
+// (supabase-js client removed — all DB access goes through lib/ingest/db.ts)
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+interface MCPServerBody {
+  $schema?:     string;
+  name:         string;
+  title?:       string;
+  description?: string;
+  version?:     string;
+  packages?:    unknown;
+  remotes?:     unknown;
+  [key: string]: unknown;
+}
+
+interface MCPRegistryMeta {
+  status?:          string;
+  statusMessage?:   string;
+  updatedAt?:       string;
+  publishedAt?:     string;
+  statusChangedAt?: string;
+  isLatest?:        boolean;
+}
+
+interface MCPRegistryItem {
+  server: MCPServerBody;
+  _meta?: {
+    'io.modelcontextprotocol.registry/official'?: MCPRegistryMeta;
+    [key: string]: unknown;
+  };
+}
+
+interface RegistryPage {
+  servers:   MCPRegistryItem[];
+  metadata?: { nextCursor?: string | null; count?: number };
+}
+
+// Row written to mcp_servers — excludes id and first_seen (set by DB defaults)
+interface ServerRow {
+  name:                string;
+  description:         string | null;
+  version:             string | null;
+  status:              string | null;
+  packages:            object | null;
+  remotes:             object | null;
+  raw:                 object;
+  source:              'registry';
+  definition_hash:     string;
+  status_hash:         string;
+  status_message_hash: string;
+  last_seen:           string;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function stableHash(item: MCPRegistryItem): string {
+  const s = item.server;
+  return createHash('sha256')
+    .update(JSON.stringify({ version: s.version ?? null, packages: s.packages ?? null, remotes: s.remotes ?? null }))
+    .digest('hex');
+}
+
+function fmtErr(e: { message?: string; details?: string; hint?: string; code?: string } | null | undefined): string {
+  if (!e) return '(null error)';
+  return JSON.stringify({ message: e.message, code: e.code, details: e.details, hint: e.hint });
+}
+
+function chunks<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+function parseSemver(v: string | null | undefined): [number, number, number] {
+  const m = (v ?? '').replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/);
+  return m ? [+m[1], +m[2], +m[3]] : [0, 0, 0];
+}
+
+function semverGt(a: string | null | undefined, b: string | null | undefined): boolean {
+  const [aMaj, aMin, aPat] = parseSemver(a);
+  const [bMaj, bMin, bPat] = parseSemver(b);
+  return aMaj !== bMaj ? aMaj > bMaj : aMin !== bMin ? aMin > bMin : aPat > bPat;
+}
+
+// progress.pages is an out-param so a mid-pagination throw still leaves the
+// number of successfully fetched pages available for the scan_runs row.
+//   include_deleted=true — surface deleted-status servers (the default scan
+//     hides them), so deletion transitions become observable.
+//   updatedSince — when set (delta mode), only servers changed since that
+//     timestamp are returned; null (full mode) sweeps everything.
+async function fetchAllItems(
+  progress: { pages: number },
+  updatedSince: string | null,
+): Promise<MCPRegistryItem[]> {
+  const all: MCPRegistryItem[] = [];
+  let cursor: string | null = null;
+
+  do {
+    const url = new URL(`${REGISTRY_BASE}/servers`);
+    url.searchParams.set('limit', String(PAGE_LIMIT));
+    url.searchParams.set('include_deleted', 'true');
+    if (updatedSince) url.searchParams.set('updated_since', updatedSince);
+    if (cursor)       url.searchParams.set('cursor', cursor);
+
+    const res = await fetch(url.toString(), {
+      headers: { 'User-Agent': 'AIVE/1.0 (aive.global)', Accept: 'application/json' },
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!res.ok) throw new Error(`Registry ${res.status}: ${await res.text().catch(() => '')}`);
+
+    const page: RegistryPage = await res.json();
+    progress.pages++;
+    all.push(...(page.servers ?? []));
+    cursor = page.metadata?.nextCursor ?? null;
+  } while (cursor);
+
+  return all;
+}
+
+/** Delta anchor: the newest snapshot captured_at from the last successful run.
+ *  null when the table is empty (first run → full sweep regardless of mode). */
+async function lastSuccessfulCapturedAt(): Promise<string | null> {
+  const rows = await q<{ captured_at: string }>(
+    'SELECT captured_at FROM mcp_server_snapshots ORDER BY captured_at DESC LIMIT 1',
+  );
+  return rows[0]?.captured_at != null ? String(rows[0].captured_at) : null;
+}
+
+// ── scan_runs bookkeeping ────────────────────────────────────────────────────
+// One row per ingest run. Failures here are logged but never abort the scan —
+// bookkeeping must not take down ingestion.
+
+async function openScanRun(startedAt: Date): Promise<string | null> {
+  try {
+    const rows = await q<{ id: string }>(
+      "INSERT INTO scan_runs (started_at, status) VALUES ($1, 'running') RETURNING id",
+      [startedAt.toISOString()],
+    );
+    return rows[0]?.id ?? null;
+  } catch (err) {
+    console.error('[ingest-mcp-registry] scan_runs insert failed:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+async function closeScanRun(
+  id: string | null,
+  fields: { pages_fetched: number; servers_returned: number | null; status: string },
+): Promise<void> {
+  if (!id) return;
+  try {
+    await q(
+      'UPDATE scan_runs SET finished_at = now(), pages_fetched = $2, servers_returned = $3, status = $4 WHERE id = $1',
+      [id, fields.pages_fetched, fields.servers_returned, fields.status],
+    );
+  } catch (err) {
+    console.error('[ingest-mcp-registry] scan_runs update failed:', err instanceof Error ? err.message : err);
+  }
+}
+
+// ── Main export ──────────────────────────────────────────────────────────────
+
+export async function ingestMCPRegistry(
+  opts: { mode?: 'full' | 'delta' } = {},
+): Promise<{
+  fetched: number; filtered: number; pages: number; upserted: number; snapshots: number;
+  mode: 'full' | 'delta'; updated_since: string | null;
+  errors: number; first_error: string | null; elapsed_ms: number;
+}> {
+  const mode = opts.mode ?? 'full';
+  const startedAt = new Date();
+  const scanRunId = await openScanRun(startedAt);
+  const progress  = { pages: 0 };
+  let upserted = 0, snapshots = 0, errors = 0;
+  let first_error: string | null = null;
+
+  // Delta mode polls only servers changed since the last successful snapshot;
+  // full mode (default; the workflow entrypoint) sweeps everything so last_seen
+  // stays a true liveness marker for every listed server. First run with an
+  // empty table always sweeps full.
+  const updatedSince = mode === 'delta' ? await lastSuccessfulCapturedAt() : null;
+
+  function recordError(label: string, e: unknown) {
+    const formatted = e && typeof e === 'object' && 'message' in e
+      ? fmtErr(e as { message?: string; code?: string; details?: string; hint?: string })
+      : String(e);
+    if (!first_error) {
+      first_error = `${label}: ${formatted}`;
+      console.error(`[ingest-mcp-registry] FIRST ERROR — ${label}:`, formatted);
+    }
+    errors++;
+  }
+
+  // ── 1. Fetch ────────────────────────────────────────────────────────────────
+  let allItems: MCPRegistryItem[];
+  try {
+    allItems = await fetchAllItems(progress, updatedSince);
+    console.log(`[ingest-mcp-registry] Fetched ${allItems.length} items across ${progress.pages} pages (mode=${mode}${updatedSince ? ` since=${updatedSince}` : ''}, include_deleted)`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error('[ingest-mcp-registry] Fetch failed:', msg);
+    await closeScanRun(scanRunId, { pages_fetched: progress.pages, servers_returned: null, status: 'error' });
+    await logIngestionPg({ sourceSlug: SOURCE_SLUG, startedAt, errorMessage: msg });
+    return { fetched: 0, filtered: 0, pages: progress.pages, upserted: 0, snapshots: 0, mode, updated_since: updatedSince, errors: 1, first_error: msg, elapsed_ms: Date.now() - startedAt.getTime() };
+  }
+
+  // ── 2. Filter: one entry per server name, strictly isLatest === true ────────
+  // Group all items by server name first so we can apply per-name selection.
+  const byName = new Map<string, MCPRegistryItem[]>();
+  for (const item of allItems) {
+    const name = item.server.name;
+    if (!name) continue;
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name)!.push(item);
+  }
+
+  const latest: MCPRegistryItem[] = [];
+  for (const [, items] of byName) {
+    // Primary: entries explicitly flagged isLatest === true
+    const flagged = items.filter(
+      i => i._meta?.['io.modelcontextprotocol.registry/official']?.isLatest === true,
+    );
+    const pool = flagged.length > 0 ? flagged : items; // fallback: all versions for this name
+    // Pick the single highest semver from the pool (proper numeric compare, not string sort)
+    const best = pool.reduce((acc, cur) =>
+      semverGt(cur.server.version, acc.server.version) ? cur : acc,
+    );
+    latest.push(best);
+  }
+  console.log(`[ingest-mcp-registry] After isLatest filter: ${latest.length} / ${allItems.length} (${byName.size} unique names)`);
+
+  // ── 3. Build in-memory row objects ──────────────────────────────────────────
+  // first_seen intentionally excluded — DB DEFAULT now() on insert, untouched on conflict.
+  const now = new Date().toISOString();
+
+  type RowWithHash = ServerRow & { _hash: string; _item: MCPRegistryItem };
+
+  const rows: RowWithHash[] = [];
+  for (const item of latest) {
+    const s    = item.server;
+    const meta = item._meta?.['io.modelcontextprotocol.registry/official'];
+    const name = s.name;
+    if (!name) { recordError('missing name', 'item.server.name is empty'); continue; }
+
+    // Status hashes use canonicalize (deep key-sort) so they agree with the
+    // backfill's hashes of the same content read back from jsonb.
+    const statusHash    = hashCanonical(meta?.status        ?? null);
+    const statusMsgHash = hashCanonical(meta?.statusMessage ?? null);
+
+    rows.push({
+      name,
+      description:         s.description   ?? null,
+      version:             s.version       ?? null,
+      status:              meta?.status    ?? null,
+      packages:            (s.packages     ?? null) as object | null,
+      remotes:             (s.remotes      ?? null) as object | null,
+      raw:                 item as object,
+      source:              'registry',
+      definition_hash:     stableHash(item),
+      status_hash:         statusHash,
+      status_message_hash: statusMsgHash,
+      last_seen:           now,
+      _hash:               stableHash(item),
+      _item:               item,
+    });
+  }
+
+  // ── 4. Process in chunks ────────────────────────────────────────────────────
+  for (const chunk of chunks(rows, CHUNK_SIZE)) {
+    const names = chunk.map(r => r.name);
+
+    // 4a. Pre-fetch existing (name, id, all three hashes) for this chunk — 1 query
+    let existingRows: { name: string; id: string; definition_hash: string | null; status_hash: string | null; status_message_hash: string | null }[];
+    try {
+      existingRows = await q(
+        'SELECT name, id, definition_hash, status_hash, status_message_hash FROM mcp_servers WHERE name = ANY($1)',
+        [names],
+      );
+    } catch (fetchErr) {
+      recordError(`pre-fetch chunk(${chunk[0].name}…)`, fetchErr);
+      continue;
+    }
+
+    const existingMap = new Map(
+      existingRows.map((r) => [r.name, { id: r.id, hash: r.definition_hash, statusHash: r.status_hash, statusMsgHash: r.status_message_hash }])
+    );
+
+    // 4b. Bulk upsert — 1 query; returns name+id for new and updated rows
+    // Strip internal _hash/_item fields before sending to Supabase
+    const upsertPayload: ServerRow[] = chunk.map(({ _hash: _h, _item: _i, ...row }) => row);
+
+    let upsertedRows: { name: string; id: string }[];
+    try {
+      const MCP_COLS = ['name', 'description', 'version', 'status', 'packages', 'remotes', 'raw', 'source', 'definition_hash', 'status_hash', 'status_message_hash', 'last_seen'];
+      upsertedRows = await upsertRows<{ name: string; id: string }>({
+        table: 'mcp_servers',
+        cols: MCP_COLS,
+        rows: upsertPayload.map((r) => [
+          r.name, r.description, r.version, r.status,
+          r.packages == null ? null : JSON.stringify(r.packages),
+          r.remotes == null ? null : JSON.stringify(r.remotes),
+          JSON.stringify(r.raw),
+          r.source, r.definition_hash, r.status_hash, r.status_message_hash, r.last_seen,
+        ]),
+        conflictCols: ['name'],
+        updateCols: ['description', 'version', 'status', 'packages', 'remotes', 'raw', 'source', 'definition_hash', 'status_hash', 'status_message_hash', 'last_seen'],
+        returning: ['name', 'id'],
+      });
+    } catch (upsertErr) {
+      recordError(`upsert chunk(${chunk[0].name}…)`, upsertErr);
+      continue;
+    }
+
+    const idMap = new Map(upsertedRows.map((r) => [r.name, r.id]));
+
+    upserted += upsertedRows.length;
+
+    // 4c. Collect snapshots for new/changed rows — no extra DB reads.
+    // Write-on-change now fires when ANY of the three hashes differs, so a
+    // status/statusMessage transition (active→deprecated→deleted) is captured
+    // even when version/packages/remotes (definition_hash) are unchanged — the
+    // gap that silently dropped deprecation/deletion transitions before.
+    const snapshotRows: object[] = [];
+    for (const row of chunk) {
+      const existing = existingMap.get(row.name);
+      const changed =
+        !existing ||
+        existing.hash !== row._hash ||
+        existing.statusHash !== row.status_hash ||
+        existing.statusMsgHash !== row.status_message_hash;
+      if (!changed) continue;
+
+      const serverId = idMap.get(row.name) ?? existing?.id;
+      if (!serverId) continue;
+
+      const meta = row._item._meta?.['io.modelcontextprotocol.registry/official'];
+      snapshotRows.push({
+        server_id:           serverId,
+        definition_hash:     row._hash,
+        status_hash:         row.status_hash,
+        status_message_hash: row.status_message_hash,
+        version:             row._item.server.version ?? null,
+        status:              meta?.status             ?? null,
+        raw:                 row._item as object,
+        captured_at:         now,
+      });
+    }
+
+    // 4d. Bulk insert snapshots — 1 query (skipped if none)
+    if (snapshotRows.length > 0) {
+      try {
+        await insertRows(
+          'mcp_server_snapshots',
+          ['server_id', 'definition_hash', 'status_hash', 'status_message_hash', 'version', 'status', 'raw', 'captured_at'],
+          (snapshotRows as any[]).map((r) => [
+            r.server_id, r.definition_hash, r.status_hash, r.status_message_hash,
+            r.version, r.status, JSON.stringify(r.raw), r.captured_at,
+          ]),
+        );
+        snapshots += snapshotRows.length;
+      } catch (snapErr) {
+        recordError(`snapshot chunk(${chunk[0].name}…)`, snapErr);
+      }
+    }
+
+    console.log(`[ingest-mcp-registry] chunk done — upserted=${upsertedRows.length} snapshots=${snapshotRows.length}`);
+  }
+
+  const elapsed_ms = Date.now() - startedAt.getTime();
+
+  await closeScanRun(scanRunId, {
+    pages_fetched:    progress.pages,
+    servers_returned: allItems.length,
+    status:           errors > 0 ? 'error' : 'success',
+  });
+
+  await logIngestionPg({
+    sourceSlug:   SOURCE_SLUG,
+    startedAt,
+    itemsFetched: allItems.length,
+    itemsNew:     upserted,
+    metadata:     { mode, updated_since: updatedSince, filtered: latest.length, pages: progress.pages, snapshots, errors, first_error, elapsed_ms },
+    ...(first_error ? { errorMessage: first_error } : {}),
+  });
+
+  // ── 5. Dashboard cache refresh REMOVED 2026-08-01 ───────────────────────────
+  // The scoped aive_ingest role deliberately has NO EXECUTE on
+  // refresh_mcp_dashboard_cache() and NO grant on mcp_dashboard_cache — the
+  // public-repo ingest identity must not be able to rewrite a private
+  // surface's cache. Until the refresh moves to a private-repo trigger, the
+  // /mcp-trust cache does NOT refresh after ingest (its reader tolerates 7
+  // days, then refuses stale data — see lib/mcp/driftDashboard.ts).
+  // PROPOSED new home (not built in this pass): the private repo invokes the
+  // existing cron-authed POST /api/mcp/refresh-dashboard after a successful
+  // ingest run — e.g. a follow-on step in the private wrapper workflow, or a
+  // monitoring.yml gate — keeping the refresh on the service-role path where
+  // it already lives.
+  console.log(`[ingest-mcp-registry] dashboard cache refresh skipped by design (scoped role) — errors=${errors}`);
+
+  console.log(`[ingest-mcp-registry] Done — mode=${mode} fetched=${allItems.length} pages=${progress.pages} filtered=${latest.length} upserted=${upserted} snapshots=${snapshots} errors=${errors} elapsed=${elapsed_ms}ms`);
+  return { fetched: allItems.length, filtered: latest.length, pages: progress.pages, upserted, snapshots, mode, updated_since: updatedSince, errors, first_error, elapsed_ms };
+}
+
+// ── Freshness tripwire ───────────────────────────────────────────────────────
+// Same pattern as the Finance-stream tripwire in run-scheduler-tick.ts: the
+// newest mcp_server_snapshots.captured_at must be younger than 48h, else the
+// standalone runner exits non-zero and the Actions run turns RED — that red
+// run IS the alert. Snapshots are write-on-change, but the registry is large
+// enough that a daily full scan writes some snapshot every day; 48h = one
+// fully missed day + buffer. MCP_FRESHNESS_HOURS overrides for testing.
+/* Data quality, not security: a bad value here skews a freshness window, it
+   does not open a gate. So this one LOGS LOUDLY and continues on the documented
+   default rather than refusing — refusing would stop an ingest for a cosmetic
+   misconfiguration. Number(undefined) is NaN, which every comparison treats as
+   false, so the check is still necessary. */
+const MCP_FRESHNESS_PARSED = parseLimit(process.env.MCP_FRESHNESS_HOURS, 48);
+if (!MCP_FRESHNESS_PARSED.ok) {
+  console.error(
+    [
+      "================================================================",
+      `  MCP_FRESHNESS_HOURS is unreadable: ${MCP_FRESHNESS_PARSED.problem}`,
+      "  Falling back to 48h. Freshness reporting will not reflect the",
+      "  configured value until this is corrected.",
+      "================================================================",
+    ].join("\n"),
+  );
+}
+const MCP_FRESHNESS_HOURS = MCP_FRESHNESS_PARSED.value ?? 48;
+
+export async function assertSnapshotFreshness(): Promise<void> {
+  let data: { captured_at: string }[];
+  try {
+    data = await q<{ captured_at: string }>(
+      'SELECT captured_at FROM mcp_server_snapshots ORDER BY captured_at DESC LIMIT 1',
+    );
+  } catch (error) {
+    throw new Error(`freshness check failed: ${error instanceof Error ? error.message : error}`);
+  }
+  const newestMs = data[0] ? Date.parse(String(data[0].captured_at)) : 0;
+  const ageHours = (Date.now() - newestMs) / 3_600_000;
+  if (ageHours > MCP_FRESHNESS_HOURS) {
+    throw new Error(
+      `MCP REGISTRY STREAM DARK: newest snapshot captured_at is ${ageHours.toFixed(1)}h old (limit ${MCP_FRESHNESS_HOURS}h)`
+    );
+  }
+  console.log(`[ingest-mcp-registry] ✓ snapshot stream fresh (newest ${ageHours.toFixed(1)}h old)`);
+}
+
+// ── Standalone runner (also the GHA daily-workflow entrypoint) ───────────────
+
+if (require.main === module) {
+  ingestMCPRegistry()
+    .then(async r => {
+      console.log('[ingest-mcp-registry] Result:', r);
+      await assertSnapshotFreshness();
+      await endIngestPool();
+      process.exit(r.errors > 0 ? 1 : 0);
+    })
+    .catch(async e => { console.error(e); await endIngestPool(); process.exit(1); });
+}

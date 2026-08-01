@@ -1,0 +1,51 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Webhook Providers Ingest — daily scan of the Pipedream and n8n public repos
+# for webhook-capable integration components.
+#
+# Moved here from the private repo 2026-08-01; cadence unchanged (05:30 UTC).
+# Exits non-zero on ingest errors or a stale snapshot stream (in-worker
+# tripwire). The red Actions run IS the alert.
+#
+# No GITHUB_TOKEN is passed: the worker makes ~2 tree-listing API calls per
+# run (fits unauthenticated limits) and fetches file contents from
+# raw.githubusercontent.com, which is not API-metered.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
+# workflow holds a database credential and must not be reachable from forks.
+#
+# Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role —
+# six tables, no delete). Nothing else.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Webhook Providers Ingest
+
+on:
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: webhook-providers-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run webhook providers scan
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+        run: npx tsx workers/ingest-webhook-providers.ts
