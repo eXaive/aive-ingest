@@ -124,14 +124,70 @@ function semverGt(a: string | null | undefined, b: string | null | undefined): b
   return aMaj !== bMaj ? aMaj > bMaj : aMin !== bMin ? aMin > bMin : aPat > bPat;
 }
 
-// progress.pages is an out-param so a mid-pagination throw still leaves the
-// number of successfully fetched pages available for the scan_runs row.
+// ── rate-limit handling (added 2026-08-02 after scheduled run #4) ───────────
+// That run walked 587 pages in 16s: the registry degraded to HTTP 200s with
+// EMPTY server arrays but valid cursors while rate-limited, then finally
+// hard-429'd — so the worker hammered a wall for the whole scan. Two changes:
+//   1. pagination HALTS on the first 429 — the failed page is retried with
+//      exponential backoff (5s/15s/45s, max 3 attempts, Retry-After honoured
+//      over the schedule when present), and if retries are exhausted the run
+//      throws (red run stays the alert) with page counts recorded so a
+//      partial scan is distinguishable from a total failure;
+//   2. a 250ms inter-page delay lowers the request rate (~12.5 req/s → 4/s
+//      with observed ~80ms/page) to avoid tripping the limit at all. At the
+//      observed 647-page full scan this adds ~162s: roughly 1 min → ~4 min.
+
+const INTER_PAGE_DELAY_MS = 250;
+const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000]; // max 3 retry attempts
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Parse Retry-After (seconds or HTTP-date) to a wait in ms; null if absent/unreadable. */
+function retryAfterMs(res: Response): number | null {
+  const raw = res.headers.get('retry-after');
+  if (!raw) return null;
+  const secs = Number(raw.trim());
+  if (Number.isFinite(secs) && secs >= 0) return Math.ceil(secs * 1000);
+  const at = Date.parse(raw);
+  if (!Number.isNaN(at)) return Math.max(0, at - Date.now());
+  return null;
+}
+
+/**
+ * Fetch one page. On 429: back off and retry the SAME page (never the next
+ * one) up to RETRY_BACKOFF_MS.length times, preferring Retry-After when the
+ * registry sends it. Returns the final Response — a still-429 response after
+ * exhaustion is returned to the caller, whose !ok throw ends the run.
+ */
+async function fetchPageWithRetry(url: string, progress: { retries: number }): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'AIVE/1.0 (aive.global)', Accept: 'application/json' },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (res.status !== 429) return res;
+    if (attempt >= RETRY_BACKOFF_MS.length) return res; // exhausted → caller throws
+    const hinted = retryAfterMs(res);
+    const waitMs = hinted ?? RETRY_BACKOFF_MS[attempt];
+    progress.retries++;
+    console.log(
+      `[ingest-mcp-registry] 429 — halting pagination; retrying this page in ${(waitMs / 1000).toFixed(0)}s ` +
+      `(attempt ${attempt + 1}/${RETRY_BACKOFF_MS.length}${hinted !== null ? ', Retry-After honoured' : ', backoff schedule'})`,
+    );
+    await res.text().catch(() => ''); // drain before waiting
+    await sleep(waitMs);
+  }
+}
+
+// progress fields are out-params so a mid-pagination throw still leaves the
+// counts available for the scan_runs row: pages = completed, pagesAttempted =
+// requests issued (completed + the page that failed), retries = 429 retries.
 //   include_deleted=true — surface deleted-status servers (the default scan
 //     hides them), so deletion transitions become observable.
 //   updatedSince — when set (delta mode), only servers changed since that
 //     timestamp are returned; null (full mode) sweeps everything.
 async function fetchAllItems(
-  progress: { pages: number },
+  progress: { pages: number; pagesAttempted: number; retries: number },
   updatedSince: string | null,
 ): Promise<MCPRegistryItem[]> {
   const all: MCPRegistryItem[] = [];
@@ -144,17 +200,19 @@ async function fetchAllItems(
     if (updatedSince) url.searchParams.set('updated_since', updatedSince);
     if (cursor)       url.searchParams.set('cursor', cursor);
 
-    const res = await fetch(url.toString(), {
-      headers: { 'User-Agent': 'AIVE/1.0 (aive.global)', Accept: 'application/json' },
-      signal: AbortSignal.timeout(30_000),
-    });
+    progress.pagesAttempted++;
+    const res = await fetchPageWithRetry(url.toString(), progress);
 
+    // A 429 here means retries are exhausted: pagination has already halted
+    // (no subsequent page was requested) and this throw ends the run red.
     if (!res.ok) throw new Error(`Registry ${res.status}: ${await res.text().catch(() => '')}`);
 
     const page: RegistryPage = await res.json();
     progress.pages++;
     all.push(...(page.servers ?? []));
     cursor = page.metadata?.nextCursor ?? null;
+
+    if (cursor) await sleep(INTER_PAGE_DELAY_MS);
   } while (cursor);
 
   return all;
@@ -166,7 +224,13 @@ async function lastSuccessfulCapturedAt(): Promise<string | null> {
   const rows = await q<{ captured_at: string }>(
     'SELECT captured_at FROM mcp_server_snapshots ORDER BY captured_at DESC LIMIT 1',
   );
-  return rows[0]?.captured_at != null ? String(rows[0].captured_at) : null;
+  // node-pg returns timestamptz as a JS Date; String(Date) is NOT RFC3339 and
+  // the registry 400s it ("Invalid updated_since format"). Normalize through
+  // toISOString() — latent since the supabase-js → pg migration (2026-08-01),
+  // invisible in CI because the workflow runs full mode (updated_since unused);
+  // found 2026-08-02 by the 429-handling pass's delta-mode test.
+  const v = rows[0]?.captured_at;
+  return v == null ? null : new Date(v).toISOString();
 }
 
 // ── scan_runs bookkeeping ────────────────────────────────────────────────────
@@ -213,7 +277,7 @@ export async function ingestMCPRegistry(
   const mode = opts.mode ?? 'full';
   const startedAt = new Date();
   const scanRunId = await openScanRun(startedAt);
-  const progress  = { pages: 0 };
+  const progress  = { pages: 0, pagesAttempted: 0, retries: 0 };
   let upserted = 0, snapshots = 0, errors = 0;
   let first_error: string | null = null;
 
@@ -242,7 +306,15 @@ export async function ingestMCPRegistry(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[ingest-mcp-registry] Fetch failed:', msg);
-    await closeScanRun(scanRunId, { pages_fetched: progress.pages, servers_returned: null, status: 'error' });
+    // Distinguish a partial scan from a total failure: pages_completed is how
+    // far pagination got before the failure; pages_attempted includes the page
+    // that failed. A rate-limit exhaustion is named as such.
+    const kind = msg.startsWith('Registry 429') ? 'error rate_limited (retries exhausted)' : 'error';
+    const scanStatus =
+      `${kind} pages_completed=${progress.pages} pages_attempted=${progress.pagesAttempted}` +
+      (progress.retries > 0 ? ` retries=${progress.retries}` : '') +
+      (progress.pages > 0 ? ' — partial scan' : ' — total failure');
+    await closeScanRun(scanRunId, { pages_fetched: progress.pages, servers_returned: null, status: scanStatus });
     await logIngestionPg({ sourceSlug: SOURCE_SLUG, startedAt, errorMessage: msg });
     return { fetched: 0, filtered: 0, pages: progress.pages, upserted: 0, snapshots: 0, mode, updated_since: updatedSince, errors: 1, first_error: msg, elapsed_ms: Date.now() - startedAt.getTime() };
   }
@@ -414,7 +486,8 @@ export async function ingestMCPRegistry(
   await closeScanRun(scanRunId, {
     pages_fetched:    progress.pages,
     servers_returned: allItems.length,
-    status:           errors > 0 ? 'error' : 'success',
+    status:           (errors > 0 ? 'error' : 'success') +
+                      (progress.retries > 0 ? ` (recovered after ${progress.retries} rate-limit ${progress.retries === 1 ? 'retry' : 'retries'})` : ''),
   });
 
   await logIngestionPg({
