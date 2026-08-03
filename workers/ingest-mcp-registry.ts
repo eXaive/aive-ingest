@@ -40,6 +40,24 @@ const PAGE_LIMIT    = 100;
 const CHUNK_SIZE    = 150;   // caps the step-4a IN-list URL (~6.6 KB at 150 × 40-char names, well under PostgREST's ~16 KB limit)
 const SOURCE_SLUG   = 'mcp-registry';
 
+// GHA pipes stdout, so Node's async pipe writes can sit in the buffer until
+// exit — run #6 produced zero live output for 30m then got killed by
+// timeout-minutes with nothing to diagnose. Force blocking (synchronous)
+// writes so every progress line streams immediately.
+(process.stdout as unknown as { _handle?: { setBlocking?: (b: boolean) => void } })._handle?.setBlocking?.(true);
+(process.stderr as unknown as { _handle?: { setBlocking?: (b: boolean) => void } })._handle?.setBlocking?.(true);
+
+// Cumulative time attribution + page counts, shared across the fetch helpers
+// as out-params so a mid-pagination throw still leaves counts readable.
+interface ScanProgress {
+  pages:          number; // completed pages
+  pagesAttempted: number; // requests issued (completed + the page in flight/failed)
+  retries:        number; // 429 retries
+  fetchMs:        number; // cumulative ms inside fetch() calls
+  sleepMs:        number; // cumulative ms in inter-page pacing sleep
+  backoffMs:      number; // cumulative ms in 429 backoff sleep
+}
+
 // (supabase-js client removed — all DB access goes through lib/ingest/db.ts)
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -159,23 +177,27 @@ function retryAfterMs(res: Response): number | null {
  * registry sends it. Returns the final Response — a still-429 response after
  * exhaustion is returned to the caller, whose !ok throw ends the run.
  */
-async function fetchPageWithRetry(url: string, progress: { retries: number }): Promise<Response> {
+async function fetchPageWithRetry(url: string, progress: ScanProgress): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
+    const tFetch = Date.now();
     const res = await fetch(url, {
       headers: { 'User-Agent': 'AIVE/1.0 (aive.global)', Accept: 'application/json' },
       signal: AbortSignal.timeout(30_000),
     });
+    progress.fetchMs += Date.now() - tFetch;
     if (res.status !== 429) return res;
     if (attempt >= RETRY_BACKOFF_MS.length) return res; // exhausted → caller throws
     const hinted = retryAfterMs(res);
     const waitMs = hinted ?? RETRY_BACKOFF_MS[attempt];
     progress.retries++;
     console.log(
-      `[ingest-mcp-registry] 429 — halting pagination; retrying this page in ${(waitMs / 1000).toFixed(0)}s ` +
-      `(attempt ${attempt + 1}/${RETRY_BACKOFF_MS.length}${hinted !== null ? ', Retry-After honoured' : ', backoff schedule'})`,
+      `[ingest-mcp-registry] 429 page=${progress.pagesAttempted} attempt=${attempt + 1}/${RETRY_BACKOFF_MS.length} backoff_ms=${waitMs} ` +
+      `(${hinted !== null ? 'Retry-After honoured' : 'backoff schedule'}) — halting pagination; retrying this page`,
     );
     await res.text().catch(() => ''); // drain before waiting
+    const tBackoff = Date.now();
     await sleep(waitMs);
+    progress.backoffMs += Date.now() - tBackoff;
   }
 }
 
@@ -187,11 +209,12 @@ async function fetchPageWithRetry(url: string, progress: { retries: number }): P
 //   updatedSince — when set (delta mode), only servers changed since that
 //     timestamp are returned; null (full mode) sweeps everything.
 async function fetchAllItems(
-  progress: { pages: number; pagesAttempted: number; retries: number },
+  progress: ScanProgress,
   updatedSince: string | null,
 ): Promise<MCPRegistryItem[]> {
   const all: MCPRegistryItem[] = [];
   let cursor: string | null = null;
+  const t0 = Date.now();
 
   do {
     const url = new URL(`${REGISTRY_BASE}/servers`);
@@ -212,7 +235,20 @@ async function fetchAllItems(
     all.push(...(page.servers ?? []));
     cursor = page.metadata?.nextCursor ?? null;
 
-    if (cursor) await sleep(INTER_PAGE_DELAY_MS);
+    if (progress.pages % 10 === 0) {
+      console.log(
+        `[ingest-mcp-registry] progress page=${progress.pages} servers=${all.length} ` +
+        `elapsed_s=${((Date.now() - t0) / 1000).toFixed(1)} ` +
+        `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs} ` +
+        `cursor=${(cursor ?? '(end)').slice(0, 16)}`,
+      );
+    }
+
+    if (cursor) {
+      const tSleep = Date.now();
+      await sleep(INTER_PAGE_DELAY_MS);
+      progress.sleepMs += Date.now() - tSleep;
+    }
   } while (cursor);
 
   return all;
@@ -277,7 +313,7 @@ export async function ingestMCPRegistry(
   const mode = opts.mode ?? 'full';
   const startedAt = new Date();
   const scanRunId = await openScanRun(startedAt);
-  const progress  = { pages: 0, pagesAttempted: 0, retries: 0 };
+  const progress: ScanProgress = { pages: 0, pagesAttempted: 0, retries: 0, fetchMs: 0, sleepMs: 0, backoffMs: 0 };
   let upserted = 0, snapshots = 0, errors = 0;
   let first_error: string | null = null;
 
@@ -286,6 +322,11 @@ export async function ingestMCPRegistry(
   // stays a true liveness marker for every listed server. First run with an
   // empty table always sweeps full.
   const updatedSince = mode === 'delta' ? await lastSuccessfulCapturedAt() : null;
+
+  console.log(
+    `[ingest-mcp-registry] start mode=${mode}` +
+    (mode === 'delta' ? ` updated_since=${updatedSince ?? '(none — empty table, full sweep)'}` : ''),
+  );
 
   function recordError(label: string, e: unknown) {
     const formatted = e && typeof e === 'object' && 'message' in e
@@ -316,6 +357,11 @@ export async function ingestMCPRegistry(
       (progress.pages > 0 ? ' — partial scan' : ' — total failure');
     await closeScanRun(scanRunId, { pages_fetched: progress.pages, servers_returned: null, status: scanStatus });
     await logIngestionPg({ sourceSlug: SOURCE_SLUG, startedAt, errorMessage: msg });
+    console.log(
+      `[ingest-mcp-registry] final status=error pages=${progress.pages} servers=0 ` +
+      `elapsed_ms=${Date.now() - startedAt.getTime()} ` +
+      `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`,
+    );
     return { fetched: 0, filtered: 0, pages: progress.pages, upserted: 0, snapshots: 0, mode, updated_since: updatedSince, errors: 1, first_error: msg, elapsed_ms: Date.now() - startedAt.getTime() };
   }
 
@@ -513,7 +559,7 @@ export async function ingestMCPRegistry(
   // it already lives.
   console.log(`[ingest-mcp-registry] dashboard cache refresh skipped by design (scoped role) — errors=${errors}`);
 
-  console.log(`[ingest-mcp-registry] Done — mode=${mode} fetched=${allItems.length} pages=${progress.pages} filtered=${latest.length} upserted=${upserted} snapshots=${snapshots} errors=${errors} elapsed=${elapsed_ms}ms`);
+  console.log(`[ingest-mcp-registry] Done — mode=${mode} fetched=${allItems.length} pages=${progress.pages} filtered=${latest.length} upserted=${upserted} snapshots=${snapshots} errors=${errors} elapsed=${elapsed_ms}ms fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`);
   return { fetched: allItems.length, filtered: latest.length, pages: progress.pages, upserted, snapshots, mode, updated_since: updatedSince, errors, first_error, elapsed_ms };
 }
 
