@@ -1,0 +1,90 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# MCP Governance Mirror — upstream MCP repo issues and discussions.
+#
+# Mirrors issues + discussions from modelcontextprotocol/registry and
+# modelcontextprotocol/modelcontextprotocol into mcp_governance_items, and
+# appends an mcp_governance_transitions row for every observed item-state flip
+# (open ↔ closed ↔ locked). TITLES AND METADATA ONLY — bodies are never
+# requested beyond what the list endpoints return, and never stored.
+#
+# MOVED HERE from the private repo (eXaive/aive-platform), where it ran inside
+# the scheduler.yml JOBS array. That schedule has been PAUSED since 2026-08-01
+# for unrelated reasons (prediction resolution semantics), so this mirror has
+# had no cadence since then — this workflow restores it. The private repo's
+# JOBS entry is removed in the same change, so there is ONE definition.
+#
+# CRON 04:30Z — clear of the 03:00Z discover sweep, the 05:00–06:15Z ingest
+# block and the 07:00Z reachability sweep. Six GitHub API requests per run.
+#
+# GITHUB_TOKEN: the Actions-provided token is passed for its 1,000 req/hr
+# quota. No PAT secret is required; the worker also runs unauthenticated
+# (60 req/hr/IP), which is still far above the ~6 requests it makes.
+#
+# Exits non-zero if any segment failed, or if the run mirrored ZERO rows —
+# two active upstream repos with hundreds of open items cannot legitimately
+# yield nothing, so zero means the write path is broken. The red run IS the
+# alert.
+#
+# Triggers: schedule + workflow_dispatch ONLY. No push, no pull_request, no
+# pull_request_target — this is a PUBLIC repo and this workflow holds a
+# database credential.
+#
+# Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role;
+# pooler host aws-1-us-east-1, NOT aws-0). No service role key.
+#
+# PREREQUISITE, and the worker refuses to run without it: mcp_governance_items
+# and mcp_governance_transitions were created service_role-only, so the scoped
+# role needs a GRANT + RLS policy pass in eXaive/aive-platform. The worker
+# preflights has_table_privilege and fails fast naming the exact grants, rather
+# than reporting a permissions wall as an upstream outage.
+# ═══════════════════════════════════════════════════════════════════════════
+name: MCP Governance Mirror
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ▶ SCHEDULE ON — enabled deliberately, and NOT in step with the discover sweep.
+#
+# This workflow's cadence is the whole point of moving the mirror here: the
+# private repo's scheduler tick has been PAUSED since 2026-08-01, so this
+# mirror has been dark since then. It is cheap and was previously daily — ~6
+# GitHub API reads per run, writing two tables it now owns outright.
+#
+# discover-mcp-servers.yml is a DIFFERENT case and stays paused: it POSTs to
+# ~9,400 third-party endpoints and has only been exercised against a
+# 25-endpoint smoke run. Do not treat this cron being live as precedent for
+# uncommenting that one.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ingest-mcp-governance
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Mirror MCP governance
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx tsx workers/ingest-mcp-governance.ts

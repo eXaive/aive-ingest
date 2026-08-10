@@ -1,0 +1,104 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# MCP server/discover sweep — one POST per MCP remote endpoint.
+#
+# Sends exactly one JSON-RPC request per endpoint:
+#   {"jsonrpc":"2.0","id":1,"method":"server/discover"}
+# server/discover is MANDATORY in MCP revision 2026-07-28 (SEP-2575) and
+# returns supported protocol versions, capabilities and identity in one
+# request. NO initialize handshake (removed in that revision), NO
+# Mcp-Session-Id (sessions removed, SEP-2567), NO Authorization, and NO
+# MCP-Protocol-Version request header (SEP-2575 moved it into the body).
+#
+# Writes mcp_endpoint_probes.protocol_versions / discover_status /
+# discover_raw. Revision strings are stored VERBATIM — public.mcp_server_era
+# guards shape at read time; normalising here would destroy the evidence that
+# guard exists to catch.
+#
+# CRON 03:00Z — STAGGERED FOUR HOURS BEFORE the 07:00Z reachability sweep
+# (probe-mcp-endpoints.yml), and clear of the 05:00–06:15Z ingest block. The
+# ordering is deliberate, not arbitrary: the reachability verdict reads the
+# LATEST probe row per endpoint, so running this sweep BEFORE the HEAD sweep
+# leaves that latest row a HEAD observation and keeps the published
+# OBSERVED/BLOCK counts on the method they document. Reversing the order would
+# silently re-base them onto POST outcomes.
+#
+# Per-host adaptive pacing: work is queued per host and dispatched
+# round-robin, per-host concurrency is 1, and a 429 raises THAT HOST's gap
+# (150ms floor, ×4 per 429, 60s ceiling, Retry-After honoured up to 5 min) and
+# defers only that host. Two hosts hold 15.6% of the corpus
+# (gateway.pipeworx.io 1,311 endpoints, server.smithery.ai 216); a flat queue
+# would let either monopolise every worker slot.
+#
+# Exits non-zero on insert errors OR on a completed run that wrote ZERO rows —
+# every outcome including every failure is recorded as a row, so zero rows
+# means the write path never worked. The red Actions run IS the alert.
+#
+# Triggers: schedule + workflow_dispatch ONLY. No push, no pull_request, no
+# pull_request_target — this is a PUBLIC repo and this workflow holds a
+# database credential, so it must be unreachable from forks and from PR events.
+#
+# Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role;
+# pooler host aws-1-us-east-1, NOT aws-0 — aws-0 fails "Tenant or user not
+# found"). No service role key. Nothing else.
+# ═══════════════════════════════════════════════════════════════════════════
+name: MCP server/discover Sweep
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⏸ SCHEDULE OFF at merge, deliberately — NOT breakage.
+#
+# The cron below is commented out so merging this PR does not start a nightly
+# 9,400-endpoint POST sweep against third-party servers before anyone has asked
+# for one. The collector is verified against a 25-endpoint live smoke run and
+# two offline suites, not against the full corpus.
+#
+# TO ENABLE: uncomment the two `schedule`/`cron` lines. Nothing else changes.
+# The 03:00Z slot is load-bearing — see the header: it must stay EARLIER than
+# the 07:00Z reachability sweep so the newest row per endpoint remains a HEAD
+# observation and the published reachability verdicts are not re-based onto
+# POST outcomes.
+#
+# workflow_dispatch stays ACTIVE, so a bounded run is available from the
+# Actions tab at any time (use the discover_limit input).
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  # schedule:
+  #   - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      discover_limit:
+        description: 'Cap endpoint count (smoke run). Leave empty for the full corpus.'
+        required: false
+        type: string
+
+concurrency:
+  group: discover-mcp-servers
+  cancel-in-progress: false
+
+# Least privilege: this job reads the repo and nothing else. No packages, no
+# id-token, no write scopes of any kind.
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run server/discover sweep
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          DISCOVER_LIMIT: ${{ inputs.discover_limit }}
+        run: npx tsx workers/discover-mcp-servers.ts
