@@ -44,25 +44,44 @@
 name: MCP server/discover Sweep
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⏸ SCHEDULE OFF at merge, deliberately — NOT breakage.
+# ▶ SCHEDULE ON since 2026-08-10, after its precondition was met and verified.
 #
-# The cron below is commented out so merging this PR does not start a nightly
-# 9,400-endpoint POST sweep against third-party servers before anyone has asked
-# for one. The collector is verified against a 25-endpoint live smoke run and
-# two offline suites, not against the full corpus.
+# The precondition was disclosure, not readiness: this collector's User-Agent
+# carries a URL, and until today that URL did not lead anywhere an operator
+# could read. Measured the same day, BEFORE enabling —
+# https://aive.global/mcp-trust/census returns 200 as a cold deep link with no
+# referrer. It returned 307 -> / until that route was added to every APP_MODE
+# allowlist (aive-platform d859d97); the dashboard itself stays gated. So an
+# operator who finds this header in their logs can read what the sweep sends,
+# what it never sends, and how to opt out BEFORE it reaches them.
 #
-# TO ENABLE: uncomment the two `schedule`/`cron` lines. Nothing else changes.
+# THE FIRST SCHEDULED RUN IS THE FIRST FULL SWEEP, by choice. No manual dispatch
+# was fired ahead of it, so the cadence an operator observes matches the "one
+# request per endpoint per day" the disclosure page states. A dispatch run
+# followed hours later by the cron would have contradicted that page on day one.
+#
 # The 03:00Z slot is load-bearing — see the header: it must stay EARLIER than
 # the 07:00Z reachability sweep so the newest row per endpoint remains a HEAD
 # observation and the published reachability verdicts are not re-based onto
 # POST outcomes.
 #
-# workflow_dispatch stays ACTIVE, so a bounded run is available from the
-# Actions tab at any time (use the discover_limit input).
+# TO PAUSE: re-comment the two `schedule`/`cron` lines. workflow_dispatch stays
+# ACTIVE either way, so a bounded run is always available from the Actions tab
+# (use the discover_limit input).
+#
+# OPEN GAP AT ENABLE TIME — recorded here rather than left to be discovered.
+# The disclosure page promises an opt-out that is honoured AND RECORDED: "add it
+# to a documented exclusion list" and "record it as excluded in our published
+# figures rather than as a gap". No such mechanism exists yet — there is no
+# exclusions table in the schema and no skip path in this worker beyond deleted
+# servers. Honouring a request today means a hand edit and a deploy. That fits
+# inside the one business day the page promises, so the promise is keepable, but
+# it is not the documented list the page describes. Build it before the first
+# request arrives, not after one has been mishandled.
 # ─────────────────────────────────────────────────────────────────────────────
 on:
-  # schedule:
-  #   - cron: '0 3 * * *'
+  schedule:
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       discover_limit:
