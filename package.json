@@ -2,13 +2,18 @@
   "name": "aive-ingest",
   "version": "1.0.0",
   "private": true,
-  "description": "Public-data ingest workers for AIVE (MCP registry, Homebrew formulae, npm SDK packages, webhook providers)",
+  "description": "Public-data ingest workers for AIVE (MCP registry, endpoint probes, server/discover, governance mirror, Homebrew formulae, npm SDK packages, webhook providers)",
   "scripts": {
     "ingest:mcp-registry": "tsx workers/ingest-mcp-registry.ts",
     "ingest:webhook-providers": "tsx workers/ingest-webhook-providers.ts",
     "ingest:homebrew-formulae": "tsx workers/ingest-homebrew-formulae.ts",
     "ingest:npm-sdk": "tsx workers/ingest-npm-sdk-packages.ts",
-    "typecheck": "tsc --noEmit"
+    "ingest:mcp-governance": "tsx workers/ingest-mcp-governance.ts",
+    "probe:mcp-endpoints": "tsx workers/probe-mcp-endpoints.ts",
+    "discover:mcp-servers": "tsx workers/discover-mcp-servers.ts",
+    "verify:host-backoff": "tsx scripts/verify-host-backoff.ts",
+    "typecheck": "tsc --noEmit",
+    "verify:rejection-parsing": "tsx scripts/verify-rejection-parsing.ts"
   },
   "dependencies": {
     "pg": "^8.22.0"
