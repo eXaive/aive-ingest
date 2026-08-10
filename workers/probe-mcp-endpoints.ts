@@ -7,8 +7,15 @@
  *   - HEAD first, GET only when HEAD returns 405
  *   - no credentials of any kind are sent (no Authorization, no cookies,
  *     nothing beyond User-Agent/Accept)
- *   - no MCP protocol negotiation is attempted (no POST, no initialize)
+ *   - no MCP protocol negotiation is attempted (no POST, no initialize,
+ *     no server/discover)
  *   - at most 2 redirects followed; the final target is recorded
+ *
+ * Protocol evidence (2026-08-09): each row also records probe_method (what
+ * was actually sent: HEAD, or GET after a 405 — never POST), content_type of
+ * the terminal response, and response_headers holding ONLY the five-header
+ * allowlist in HEADER_ALLOWLIST below. Passive capture from responses the
+ * probe already receives — the request surface is unchanged.
  *
  * Identification: requests carry a User-Agent naming AIVE with a contact URL
  * (see USER_AGENT below). Concurrency is capped at 8 with a minimum 100ms
@@ -54,6 +61,38 @@ type ErrorClass =
   | 'dns_failure' | 'connection_refused' | 'timeout' | 'tls_error'
   | 'rate_limited' | 'http_error' | 'ok' | 'template_placeholder' | 'other';
 
+// response_headers allowlist — ONLY these five are ever stored, lowercase.
+//   server / www-authenticate : infra + auth-scheme identification
+//   x-accel-buffering         : SSE-behind-proxy signal
+//   mcp-protocol-version      : infra identification and corroboration only —
+//                               NOT era evidence. Revision 2026-07-28 REQUIRES
+//                               this header on every POST, so its presence
+//                               dates a server not at all (migration
+//                               20260809000017, which retracted the earlier
+//                               claim in …0013 that it did).
+//   mcp-session-id            : ONE-WAY era evidence. Sessions were removed in
+//                               2026-07-28 and a conformant server must ignore
+//                               the header and never mint or echo one, so a
+//                               response carrying it is running an older
+//                               revision. Presence proves that; ABSENCE PROVES
+//                               NOTHING.
+// Arbitrary headers are NEVER stored: bounded row size, no accidental
+// capture of anything reflective or sensitive. Values truncated to 256.
+const HEADER_ALLOWLIST = [
+  'server', 'www-authenticate', 'x-accel-buffering',
+  'mcp-protocol-version', 'mcp-session-id',
+] as const;
+const HEADER_VALUE_MAX = 256;
+
+function pickAllowlistedHeaders(h: Headers): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const name of HEADER_ALLOWLIST) {
+    const v = h.get(name);
+    if (v !== null) out[name] = v.slice(0, HEADER_VALUE_MAX);
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 interface ProbeRow {
   server_id: string;
   endpoint_url: string;
@@ -64,6 +103,12 @@ interface ProbeRow {
   tls_valid: boolean | null;
   redirect_target: string | null;
   note: string | null;
+  // Protocol evidence. probe_method is the method of the attempt this row
+  // records ('HEAD' | 'GET', even when that attempt threw); null = no
+  // request was made (template placeholder / invalid URL / non-http scheme).
+  probe_method: 'HEAD' | 'GET' | null;
+  content_type: string | null;
+  response_headers: Record<string, string> | null;
 }
 
 // ── per-host pacing gate ─────────────────────────────────────────────────────
@@ -124,6 +169,7 @@ async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
     server_id: serverId, endpoint_url: url, probed_at: probedAt,
     http_status: null, response_time_ms: null, error_class: 'other',
     tls_valid: null, redirect_target: null, note: null,
+    probe_method: null, content_type: null, response_headers: null,
   };
 
   // Template placeholders: recorded, never fetched.
@@ -148,16 +194,30 @@ async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
   let current = parsed;
   let redirects = 0;
   let redirectTarget: string | null = null;
+  // Method of the most recent attempt — recorded even when the attempt
+  // throws (probe_method is evidence of what we SENT, not what answered).
+  let method: 'HEAD' | 'GET' = 'HEAD';
+
+  // Passive evidence from a response the probe already holds. Terminal
+  // responses only — callers below invoke this exactly where they record
+  // http_status, so evidence always describes the same response as the row.
+  const evidence = (res: Response) => ({
+    probe_method: method,
+    content_type: res.headers.get('content-type')?.slice(0, HEADER_VALUE_MAX) ?? null,
+    response_headers: pickAllowlistedHeaders(res.headers),
+  });
 
   while (true) {
     await paceHost(current.hostname);
     const t0 = Date.now();
     let res: Response;
     try {
+      method = 'HEAD';
       res = await fetchOnce(current.href, 'HEAD');
       // HEAD → GET fallback only on 405 Method Not Allowed.
       if (res.status === 405) {
         await paceHost(current.hostname);
+        method = 'GET';
         res = await fetchOnce(current.href, 'GET');
         notes.push('HEAD returned 405; probed with GET');
       }
@@ -168,6 +228,7 @@ async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
         ...base, response_time_ms: Date.now() - t0, error_class: cls,
         tls_valid: tls ?? (cls === 'tls_error' ? false : null),
         redirect_target: redirectTarget, note: notes.length ? notes.join('; ').slice(0, 400) : null,
+        probe_method: method,
       };
     }
     const elapsed = Date.now() - t0;
@@ -187,6 +248,7 @@ async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
         error_class: 'ok', tls_valid: isHttps ? true : null,
         redirect_target: redirectTarget,
         note: [...notes, `redirect budget (${MAX_REDIRECTS}) exhausted — not followed further`].join('; ').slice(0, 400),
+        ...evidence(res),
       };
     }
 
@@ -206,6 +268,7 @@ async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
       tls_valid: (isHttps || current.protocol === 'https:') ? true : null,
       redirect_target: redirectTarget,
       note: notes.length ? notes.join('; ').slice(0, 400) : null,
+      ...evidence(res),
     };
   }
 }
@@ -296,7 +359,7 @@ export async function probeMcpEndpoints(): Promise<{
   // probes), same posture as the ingest workers' during-run chunk writes: a
   // process death mid-sweep keeps everything probed so far instead of losing
   // the hour. Insert failures are run errors (red run), never dropped silently.
-  const COLS = ['server_id', 'endpoint_url', 'probed_at', 'http_status', 'response_time_ms', 'error_class', 'tls_valid', 'redirect_target', 'note'];
+  const COLS = ['server_id', 'endpoint_url', 'probed_at', 'http_status', 'response_time_ms', 'error_class', 'tls_valid', 'redirect_target', 'note', 'probe_method', 'content_type', 'response_headers'];
   const byClass: Record<string, number> = {};
   let written = 0;
   let pending: ProbeRow[] = [];
@@ -309,6 +372,10 @@ export async function probeMcpEndpoints(): Promise<{
       await insertRows('mcp_endpoint_probes', COLS, chunk.map((r) => [
         r.server_id, r.endpoint_url, r.probed_at, r.http_status, r.response_time_ms,
         r.error_class, r.tls_valid, r.redirect_target, r.note,
+        // jsonb pre-serialized per lib/ingest/db contract (node-pg would
+        // otherwise mangle objects into Postgres array/record literals).
+        r.probe_method, r.content_type,
+        r.response_headers ? JSON.stringify(r.response_headers) : null,
       ]));
       written += chunk.length;
     } catch (err) {
