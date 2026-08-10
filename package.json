@@ -13,7 +13,8 @@
     "discover:mcp-servers": "tsx workers/discover-mcp-servers.ts",
     "verify:host-backoff": "tsx scripts/verify-host-backoff.ts",
     "typecheck": "tsc --noEmit",
-    "verify:rejection-parsing": "tsx scripts/verify-rejection-parsing.ts"
+    "verify:rejection-parsing": "tsx scripts/verify-rejection-parsing.ts",
+    "verify:write-access": "tsx scripts/verify-write-access.ts"
   },
   "dependencies": {
     "pg": "^8.22.0"

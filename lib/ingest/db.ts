@@ -102,6 +102,45 @@ export async function insertRows(table: string, cols: string[], rows: unknown[][
   await ingestPool().query(`INSERT INTO ${table} (${cols.join(',')}) VALUES ${tuples.join(',')}`, values);
 }
 
+/**
+ * Run `fn` inside a transaction that is ALWAYS rolled back, on ONE pinned
+ * connection.
+ *
+ * WHY THIS EXISTS AND WHY IT IS NOT JUST q('BEGIN'). q() calls
+ * ingestPool().query(), which checks a connection out of the pool PER CALL. A
+ * BEGIN issued that way can land on a different connection from the INSERT that
+ * follows and the ROLLBACK after it — which would leave the write COMMITTED
+ * (each statement autocommitting on its own connection) and a transaction
+ * dangling open on a third. For a probe whose whole purpose is to write and then
+ * not persist, that is the one failure mode that must be impossible.
+ *
+ * So: one client checked out explicitly, BEGIN, callback, ROLLBACK in a
+ * `finally`, release in an outer `finally`. The rollback runs whether the
+ * callback returns or throws, and a failed ROLLBACK throws rather than being
+ * swallowed — a probe must never report success while its writes are still live.
+ *
+ * This guarantees the ROLLBACK was ISSUED. It does not by itself prove nothing
+ * persisted; callers verify that separately by row count and sentinel search,
+ * because those are different claims.
+ */
+export async function withRollback<T>(
+  fn: (exec: (text: string, params?: unknown[]) => Promise<unknown[]>) => Promise<T>,
+): Promise<T> {
+  const client = await ingestPool().connect();
+  try {
+    await client.query('BEGIN');
+    try {
+      const exec = async (text: string, params?: unknown[]) =>
+        (await client.query(text, params)).rows as unknown[];
+      return await fn(exec);
+    } finally {
+      await client.query('ROLLBACK');
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /** Drain the pool so the process can exit naturally (process.exitCode style). */
 export async function endIngestPool(): Promise<void> {
   const p = pool;
