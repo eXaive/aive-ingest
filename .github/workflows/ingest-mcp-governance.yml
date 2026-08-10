@@ -41,26 +41,21 @@
 name: MCP Governance Mirror
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⏸ SCHEDULE OFF at merge — conservative reading of a standing instruction,
-# NOT a judgement that this workflow is unsafe.
+# ▶ SCHEDULE ON — enabled deliberately, and NOT in step with the discover sweep.
 #
-# Unlike the discover sweep, this one is cheap and previously ran daily: ~6
-# GitHub API reads, writes to two tables it now owns outright. Restoring its
-# cadence is the WHOLE POINT of moving it here — the private repo's scheduler
-# tick has been paused since 2026-08-01, so this mirror has been dark since
-# then. Leaving the cron commented means the move relocates it without yet
-# fixing it.
+# This workflow's cadence is the whole point of moving the mirror here: the
+# private repo's scheduler tick has been PAUSED since 2026-08-01, so this
+# mirror has been dark since then. It is cheap and was previously daily — ~6
+# GitHub API reads per run, writing two tables it now owns outright.
 #
-# It is off anyway because the instruction accompanying this PR was "schedule
-# stays OFF", unqualified, and enabling any cron on someone else's behalf is
-# not a call to make from an ambiguous sentence. This one is very likely meant
-# to go on; ASK, then uncomment the two `schedule`/`cron` lines.
-#
-# workflow_dispatch stays ACTIVE.
+# discover-mcp-servers.yml is a DIFFERENT case and stays paused: it POSTs to
+# ~9,400 third-party endpoints and has only been exercised against a
+# 25-endpoint smoke run. Do not treat this cron being live as precedent for
+# uncommenting that one.
 # ─────────────────────────────────────────────────────────────────────────────
 on:
-  # schedule:
-  #   - cron: '30 4 * * *'
+  schedule:
+    - cron: '30 4 * * *'
   workflow_dispatch:
 
 concurrency:
