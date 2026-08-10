@@ -104,8 +104,19 @@ import {
   classifyException, classifyStatus, parseRetryAfter, type ErrorClass,
 } from '../lib/mcp/errorClass';
 
+// Points at the DISCLOSURE PAGE, not at this repo (changed 2026-08-10). An
+// operator who finds this string in an access log needs the page that says what
+// we send, what we never send, and how to be excluded — not a source tree they
+// have to read to work that out. The page carries the repo link for anyone who
+// does want the source.
+//
+// BYTE-IDENTICAL to DISCOVER_USER_AGENT in eXaive/aive-platform
+// app/mcp-trust/census/page.tsx, which renders this string as the thing
+// operators match against, and the URL must resolve to that same route. If
+// either copy changes, change both in the same pass — a disclosure URL that
+// 404s is worse than no URL at all.
 const USER_AGENT =
-  'AIVE-MCP-Discover/1.0 (+https://github.com/eXaive/aive-ingest; one server/discover POST per endpoint, no auth attempted)';
+  'AIVE-MCP-Discover/1.0 (+https://aive.global/mcp-trust/census; one server/discover POST per endpoint, no auth attempted)';
 
 const SOURCE_SLUG = 'mcp-discover';
 
