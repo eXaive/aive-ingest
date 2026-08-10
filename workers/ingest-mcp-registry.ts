@@ -545,19 +545,45 @@ export async function ingestMCPRegistry(
     ...(first_error ? { errorMessage: first_error } : {}),
   });
 
-  // ── 5. Dashboard cache refresh REMOVED 2026-08-01 ───────────────────────────
-  // The scoped aive_ingest role deliberately has NO EXECUTE on
-  // refresh_mcp_dashboard_cache() and NO grant on mcp_dashboard_cache — the
-  // public-repo ingest identity must not be able to rewrite a private
-  // surface's cache. Until the refresh moves to a private-repo trigger, the
-  // /mcp-trust cache does NOT refresh after ingest (its reader tolerates 7
-  // days, then refuses stale data — see lib/mcp/driftDashboard.ts).
-  // PROPOSED new home (not built in this pass): the private repo invokes the
-  // existing cron-authed POST /api/mcp/refresh-dashboard after a successful
-  // ingest run — e.g. a follow-on step in the private wrapper workflow, or a
-  // monitoring.yml gate — keeping the refresh on the service-role path where
-  // it already lives.
-  console.log(`[ingest-mcp-registry] dashboard cache refresh skipped by design (scoped role) — errors=${errors}`);
+  // ── 5. Dashboard cache refresh — POST-INGEST TRIGGER (restored 2026-08-10) ──
+  // Removed 2026-08-01 because this role has no write access to
+  // mcp_dashboard_cache. The gap was then filled by a pg_cron job at a FIXED
+  // 05:30 UTC, which fires BEFORE this ingest whenever Actions delays it (it
+  // finished 05:48 on 08-09 and 06:15 on 08-10 — both after 05:30). The surface
+  // consequently served the PREVIOUS day's ingest. A later fixed time races the
+  // same way, so the trigger belongs HERE, following the data, not the clock.
+  //
+  // trigger_mcp_dashboard_refresh() is a security-definer wrapper (migration
+  // 20260810000001) that gives this role exactly one capability: request a
+  // recompute. It still cannot write mcp_dashboard_cache, so the 2026-08-01
+  // boundary holds — what changed is WHO MAY ASK, not who may write.
+  //
+  // ORDERING IS DELIBERATE: this runs AFTER logIngestionPg above, so that row
+  // records the DATA ingest's outcome only. A cache-refresh failure must not
+  // mark the ingest unsuccessful — lib/mcp/pipelineStreak.ts reads that row for
+  // pipeline liveness, and the data did land.
+  //
+  // A failed refresh DOES redden the run (errors++ → exit 1) rather than
+  // logging quietly: a green run over a stale surface is the exact hollow
+  // success this change exists to remove. The 12:00 UTC fallback repairs the
+  // cache in the meantime.
+  if (errors === 0) {
+    try {
+      const refreshed = await q<{ computed_at: string | null }>(
+        'SELECT public.trigger_mcp_dashboard_refresh() AS computed_at',
+      );
+      console.log(`[ingest-mcp-registry] dashboard cache refreshed at ${refreshed[0]?.computed_at ?? 'unknown'}`);
+    } catch (err) {
+      errors++;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[ingest-mcp-registry] dashboard cache refresh FAILED: ${msg} — the INGEST ITSELF SUCCEEDED ` +
+        `(ingestion_log already written); only the /mcp-trust cache is stale, and the 12:00 UTC pg_cron fallback will repair it`,
+      );
+    }
+  } else {
+    console.log(`[ingest-mcp-registry] dashboard cache refresh skipped — run had errors=${errors}, refusing to cache a bad ingest`);
+  }
 
   console.log(`[ingest-mcp-registry] Done — mode=${mode} fetched=${allItems.length} pages=${progress.pages} filtered=${latest.length} upserted=${upserted} snapshots=${snapshots} errors=${errors} elapsed=${elapsed_ms}ms fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`);
   return { fetched: allItems.length, filtered: latest.length, pages: progress.pages, upserted, snapshots, mode, updated_since: updatedSince, errors, first_error, elapsed_ms };
