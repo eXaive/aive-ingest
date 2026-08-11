@@ -650,6 +650,11 @@ export async function runSweep(
   concurrency: number,
   perform: (item: Item) => Promise<Outcome>,
   onRow: (row: DiscoverRow) => Promise<void> | void,
+  /**
+   * Backstop for a `perform` that throws despite its contract. Optional so the
+   * two verify scripts that call this with four arguments keep working.
+   */
+  onThrow?: (item: Item, err: unknown) => void,
 ): Promise<number> {
   let done = 0;
   const worker = async () => {
@@ -660,7 +665,29 @@ export async function runSweep(
       const { item, state } = claimed;
       item.attempts++;
 
-      const outcome = await perform(item);
+      // SECOND LAYER of per-endpoint isolation. `perform` is contracted never to
+      // throw — discoverSafely() in main() guarantees a row for every outcome —
+      // and this catch is the backstop for when that contract is broken anyway.
+      //
+      // Why it has to exist: this await had no guard, so a single endpoint's
+      // throw propagated out of the worker, rejected the Promise.all below, and
+      // took every other in-flight worker with it. Promise.all rejects on the
+      // FIRST failure and abandons the rest — that is how one stalled body ended
+      // an 11,006-endpoint sweep at endpoint 1,500.
+      //
+      // The host is released BEFORE anything else. A throw that skipped
+      // sched.release() would leak a permanently-held concurrency slot, and
+      // enough of those would wedge the sweep into claiming nothing while
+      // looking alive. `false` because a throw is not evidence the host is
+      // healthy, so its adaptive gap must not decay on the strength of it.
+      let outcome: Outcome;
+      try {
+        outcome = await perform(item);
+      } catch (err) {
+        sched.release(state, false);
+        onThrow?.(item, err);
+        continue;
+      }
 
       if (outcome.kind === 'retry') {
         sched.penalise(state, outcome.retryAfterMs, Date.now());
@@ -772,7 +799,44 @@ export async function discoverOnce(
     return canRetry ? { kind: 'retry', retryAfterMs, row } : { kind: 'row', row };
   }
 
-  const body = await readBounded(res);
+  // THE ONE AWAIT IN THIS FUNCTION THAT USED TO BE UNGUARDED, and the cause of
+  // the 2026-08-11 04:12Z sweep dying after 1,500 of 11,006 endpoints.
+  //
+  // The AbortSignal.timeout attached to the fetch above is STILL ARMED here.
+  // fetch() settles as soon as headers arrive, so an endpoint that answers
+  // promptly and then stalls mid-body has its stream aborted at TIMEOUT_MS and
+  // reader.read() inside readBounded rejects with DOMException [TimeoutError].
+  // readBounded has try/FINALLY and no catch, so that rejection passes straight
+  // through it; with nothing here it escaped discoverOnce, escaped the worker
+  // loop, rejected Promise.all and killed every in-flight worker. One endpoint
+  // out of eleven thousand was enough.
+  //
+  // The stack for that crash carried no application frames at all — the
+  // DOMException is constructed in the abort timer's callback, so it reads as
+  // Timeout._onTimeout -> listOnTimeout and points at nothing you can fix. This
+  // note exists so the next person to meet that trace need not re-derive it.
+  //
+  // A stalled body is a transport fact like any other, so it becomes a ROW.
+  // classifyException maps TimeoutError/AbortError to 'timeout', already in the
+  // CHECK vocabulary, so no schema change is needed. Everything learned from the
+  // headers — status, content-type, elapsed — is preserved through `shared`: the
+  // response did arrive, only its body never finished.
+  let body: string;
+  try {
+    body = await readBounded(res);
+  } catch (err) {
+    const { cls, tls, raw } = classifyException(err);
+    notes.push(`body read aborted after ${Date.now() - t0}ms: ${raw.slice(0, 160)}`);
+    return {
+      kind: 'row',
+      row: finish({
+        ...shared,
+        error_class: cls,
+        tls_valid: tls ?? (isHttps ? true : null),
+        discover_status: 'error',
+      }),
+    };
+  }
   const envelope = parseEnvelope(body, contentType);
 
   // Transport failed (4xx/5xx). Three distinguishable facts live in here and
@@ -1050,29 +1114,132 @@ export async function discoverMcpServers(): Promise<{
   };
 
   let seen = 0;
-  const done = await runSweep(
-    sched,
-    concurrency,
-    (item) => discoverOnce(item, probeMethodValue, methodNote),
-    async (row) => {
-      byStatus[row.discover_status] = (byStatus[row.discover_status] ?? 0) + 1;
-      pending.push(row);
-      seen++;
-      if (pending.length >= INSERT_CHUNK) await flush();
-      if (seen % 500 === 0) {
-        const s = sched.stats();
-        console.log(`[discover-mcp-servers] ${seen}/${items.length} · 429s=${s.total429} · hosts backed off=${s.hostsBackedOff} · worst gap=${s.worstGapMs}ms`);
-      }
-    },
-  );
-  await flush();
+  let thrown = 0;
+
+  const hostOf = (url: string): string => {
+    try { return new URL(url).hostname.toLowerCase(); } catch { return '(unparseable)'; }
+  };
+
+  /**
+   * FIRST LAYER of per-endpoint isolation, and the contract runSweep's backstop
+   * relies on: THIS NEVER THROWS.
+   *
+   * discoverOnce already classifies every transport outcome into a row itself.
+   * Anything that still escapes it is a defect in this worker rather than a fact
+   * about the endpoint — and it becomes a row anyway, so it is visible in the
+   * DATA and not only in a log line that scrolls past.
+   *
+   * error_class is 'other' because the CHECK vocabulary on
+   * mcp_endpoint_probes.error_class admits nine values and has none for "the
+   * prober itself threw"; 'other' is the vocabulary's designated slot for an
+   * unmatched failure whose raw text goes in note. The note carries a stable
+   * `probe_exception:` prefix so the class is queryable without a schema change:
+   *
+   *     select endpoint_url, note from mcp_endpoint_probes
+   *      where note like 'probe_exception:%';
+   *
+   * A dedicated error_class would need a migration in eXaive/aive-platform to
+   * widen that CHECK. One is written and NOT applied — see the report.
+   */
+  const discoverSafely = async (item: Item): Promise<Outcome> => {
+    try {
+      return await discoverOnce(item, probeMethodValue, methodNote);
+    } catch (err) {
+      thrown++;
+      const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      // THE INSTRUMENTATION THE 2026-08-11 POST-MORTEM DID NOT HAVE. The endpoint
+      // that ended that sweep wrote no row and emitted no log line, so it was
+      // unidentifiable from every surviving artefact — the DB, the run log and
+      // the stack all pointed nowhere. URL and host, on every throw, always.
+      console.error(
+        `[discover-mcp-servers] endpoint THREW (recorded as a row, sweep continues) ` +
+        `host=${hostOf(item.url)} url=${item.url} attempts=${item.attempts} — ${msg}`,
+      );
+      if (err instanceof Error && err.stack) console.error(err.stack);
+      return {
+        kind: 'row',
+        row: {
+          server_id: item.serverId, endpoint_url: item.url,
+          probed_at: new Date().toISOString(),
+          http_status: null, response_time_ms: null,
+          error_class: 'other', tls_valid: null,
+          note: `probe_exception: ${msg}`.slice(0, 400),
+          probe_method: probeMethodValue, content_type: null,
+          protocol_versions: null, version_source: null,
+          discover_status: 'error', discover_raw: null,
+        },
+      };
+    }
+  };
+
+  // `done` and the abort are declared out here so the finally below can report
+  // them whether the sweep finished or died partway.
+  let done = 0;
+  let sweepError: unknown = null;
+  const hostStatsAtEnd = () => sched.stats();
+
+  try {
+    done = await runSweep(
+      sched,
+      concurrency,
+      discoverSafely,
+      async (row) => {
+        byStatus[row.discover_status] = (byStatus[row.discover_status] ?? 0) + 1;
+        pending.push(row);
+        seen++;
+        if (pending.length >= INSERT_CHUNK) await flush();
+        if (seen % 500 === 0) {
+          const s = sched.stats();
+          console.log(`[discover-mcp-servers] ${seen}/${items.length} · 429s=${s.total429} · hosts backed off=${s.hostsBackedOff} · worst gap=${s.worstGapMs}ms`);
+        }
+      },
+      (item, err) => {
+        // Reached only if discoverSafely's own contract is broken. Logged
+        // separately from the row-producing path so the two are never confused.
+        console.error(
+          `[discover-mcp-servers] BACKSTOP: perform() threw despite its contract ` +
+          `host=${hostOf(item.url)} url=${item.url} — ` +
+          `${err instanceof Error ? `${err.name}: ${err.message}` : String(err)} ` +
+          `(no row written for this endpoint)`,
+        );
+      },
+    );
+  } catch (err) {
+    sweepError = err;
+    console.error(
+      '[discover-mcp-servers] SWEEP ABORTED — flushing what completed and closing the run:',
+      err instanceof Error ? err.stack ?? err.message : err,
+    );
+  } finally {
+    // BOTH OF THESE USED TO SIT AFTER runSweep WITH NOTHING PROTECTING THEM.
+    // On 2026-08-11 that cost a 500-row partial chunk that had already been
+    // probed, and left scan_runs 2680f1c2 at status='running' with finished_at
+    // NULL — a run that reads as still in progress to anything checking
+    // freshness, rather than as the failure it was. In a finally, a throw still
+    // banks completed work and still closes the books on it.
+    await flush();
+    const hs = hostStatsAtEnd();
+    const statusStr = Object.entries(byStatus).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ');
+    // `done` is only assigned when runSweep RETURNS, so on an abort it is still 0
+    // while rows have plainly been written — the injected-fault test produced
+    // "attempted=0 written=8", which reads as an impossibility. `seen` counts
+    // every probe that reached onRow, so it is the honest figure on both paths
+    // and equals `done` on a clean run.
+    const attempted = sweepError ? seen : done;
+    const status =
+      `${sweepError ? 'failed' : errors > 0 ? 'error' : 'ok'} attempted=${attempted} written=${written} ${statusStr}` +
+      `${thrown > 0 ? ` thrown=${thrown}` : ''}` +
+      `${limited ? ' SMOKE' : ''}${hs.deadlineHit ? ` DEADLINE undispatched=${hs.undispatched}` : ''}` +
+      `${sweepError ? ` ABORTED: ${sweepError instanceof Error ? `${sweepError.name}: ${sweepError.message}` : String(sweepError)}` : ''}`;
+    await closeScanRun(scanId, written, status.slice(0, 500));
+  }
+
+  // A sweep that aborted is a failed run, not a short one. Rethrow AFTER the
+  // finally has flushed and closed, so the workflow still exits non-zero.
+  if (sweepError) throw sweepError;
 
   const hostStats = sched.stats();
   const statusStr = Object.entries(byStatus).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ');
-  const status =
-    `${errors > 0 ? 'error' : 'ok'} attempted=${done} written=${written} ${statusStr}` +
-    `${limited ? ' SMOKE' : ''}${hostStats.deadlineHit ? ` DEADLINE undispatched=${hostStats.undispatched}` : ''}`;
-  await closeScanRun(scanId, written, status);
 
   // A partial sweep is stated, never implied. Silent truncation would read as
   // full coverage on the next panel that counts these rows.
@@ -1095,11 +1262,13 @@ export async function discoverMcpServers(): Promise<{
       total_429: hostStats.total429, hosts_backed_off: hostStats.hostsBackedOff,
       worst_gap_ms: hostStats.worstGapMs, smoke_run: limited,
       deadline_hit: hostStats.deadlineHit, undispatched: hostStats.undispatched,
+      // endpoints whose probe threw and were recorded as probe_exception rows
+      endpoints_thrown: thrown,
       probe_method: probeMethodValue ?? 'NULL (CHECK does not admit POST)',
     },
   });
 
-  console.log(`[discover-mcp-servers] done — attempted=${done} written=${written} errors=${errors}`);
+  console.log(`[discover-mcp-servers] done — attempted=${done} written=${written} errors=${errors} thrown=${thrown}`);
   console.log(`[discover-mcp-servers] status breakdown: ${statusStr || '(none)'}`);
   console.log(`[discover-mcp-servers] hosts=${hostStats.hosts} backed_off=${hostStats.hostsBackedOff} 429s=${hostStats.total429} worst_gap=${hostStats.worstGapMs}ms busiest=${hostStats.top.join(' ')}`);
 
