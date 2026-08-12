@@ -48,11 +48,23 @@ export interface ExclusionReader {
 export interface Exclusion {
   scope: 'endpoint' | 'host' | 'server';
   pattern: string;
-  applies_to: 'all' | 'discover' | 'tools';
+  applies_to: 'all' | 'discover' | 'tools' | 'resources' | 'prompts';
 }
 
-/** Which collector is asking. Matches mcp_exclusions.applies_to. */
-export type Method = 'discover' | 'tools';
+/**
+ * Which collector is asking. Matches mcp_exclusions.applies_to, widened by
+ * aive-platform migration 20260813000001 for the two listing methods.
+ *
+ * WIDENING IS ADDITIVE AND SAFE IN BOTH DIRECTIONS. A row reading 'all' now
+ * expands to four methods rather than two, so an operator who asked us to stop
+ * entirely is opted out of the new methods WITHOUT having to ask again -- which
+ * is the only acceptable default, since they cannot have known to ask about a
+ * method that did not exist. In the other direction, a worker running older
+ * code that meets a row saying 'resources' falls into methodsFor's unrecognised
+ * branch and honours it across every method it knows: broader than intended,
+ * never narrower.
+ */
+export type Method = 'discover' | 'tools' | 'resources' | 'prompts';
 
 /**
  * The loaded set, pre-indexed. Three maps rather than one list so matching is a
@@ -75,12 +87,15 @@ export interface ExclusionTarget {
   serverId: string;
 }
 
-const METHODS: Method[] = ['discover', 'tools'];
+const METHODS: Method[] = ['discover', 'tools', 'resources', 'prompts'];
 
 /** Expand applies_to into the concrete methods it covers. */
 function methodsFor(appliesTo: string): Method[] {
   if (appliesTo === 'all') return METHODS;
-  if (appliesTo === 'discover' || appliesTo === 'tools') return [appliesTo];
+  if (
+    appliesTo === 'discover' || appliesTo === 'tools' ||
+    appliesTo === 'resources' || appliesTo === 'prompts'
+  ) return [appliesTo];
   // An unrecognised value is treated as covering EVERYTHING. If someone adds a
   // value to the CHECK constraint and forgets this file, the safe reading of
   // "we do not understand this exclusion" is to honour it broadly rather than
