@@ -49,8 +49,14 @@
  * TOOLS_CONCURRENCY (default 8), TOOLS_DEADLINE_MINUTES (default 60).
  */
 
-import { q, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
+import { q, ingestPool, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
+// Operator opt-outs, SHARED with discover-mcp-servers.ts. Not a second copy of
+// the matching rules: this worker's dispatch loop already restates runSweep's
+// (a filed todo, precisely because a fix to one will not reach the other), and
+// repeating that with an opt-out mechanism would mean honouring a request in one
+// collector while still dialling from the other.
+import { loadExclusions, isExcluded, exclusionNote } from '../lib/mcp/exclusions';
 import { classifyException, classifyStatus, parseRetryAfter } from '../lib/mcp/errorClass';
 import {
   schemaHash, contractHash, paramSet, paramCount, requiredCount, maxDepth,
@@ -109,7 +115,15 @@ function toolsHeaders(): Record<string, string> {
   };
 }
 
-export type CaptureStatus = 'ok' | 'error' | 'unsupported' | 'session_required' | 'not_attempted';
+/**
+ * Mirrors the CHECK on mcp_tool_captures.status exactly. 'excluded' is a sixth
+ * value, NOT an overload of 'not_attempted': that one means the corpus or the
+ * deadline stopped us, and merging the two would make "how much of the corpus did
+ * we choose not to measure" unanswerable separately from "how much could we not
+ * measure". Widened by migration 20260812000007 in eXaive/aive-platform.
+ */
+export type CaptureStatus =
+  | 'ok' | 'error' | 'unsupported' | 'session_required' | 'not_attempted' | 'excluded';
 
 export interface ToolRow {
   tool_name: string;
@@ -538,6 +552,39 @@ export async function collectMcpTools(): Promise<{
     console.log(`[collect-mcp-tools] TOOLS_LIMIT=${limitParsed.value} -- SMOKE RUN, NOT a full sweep`);
   }
 
+  /* ── operator opt-outs ──────────────────────────────────────────────────────
+   *
+   * Loaded ONCE, here: the target set is final and nothing has been dialled yet.
+   * Excluded targets are removed BEFORE the scheduler is built, so "no request
+   * was sent" is a fact about control flow rather than a conditional inside
+   * collectOnce that a later edit could reorder past the fetch.
+   *
+   * NOTE THE NAME. `excluded` above is already taken, and means something
+   * different: endpoints the reference sweep filtered out by discover_status.
+   * That is a property of the corpus. THIS is a human decision by an operator,
+   * and conflating the two would make "how much did we choose not to measure"
+   * unanswerable -- which is the one question the disclosure page commits to
+   * answering. Hence optOut* throughout.
+   *
+   * FAIL CLOSED: an unreadable table throws before the first dial. loadExclusions
+   * owns that decision and its reasoning; see lib/mcp/exclusions.ts.
+   */
+  const optOutSet = await loadExclusions(ingestPool());
+  const corpusSize = targets.length;
+  const optOutTargets: { target: Target; note: string }[] = [];
+  const dialable: Target[] = [];
+  for (const t of targets) {
+    const match = isExcluded({ url: t.url, host: t.host, serverId: t.serverId }, optOutSet, 'tools');
+    if (match.excluded) optOutTargets.push({ target: t, note: exclusionNote(match) });
+    else dialable.push(t);
+  }
+  targets = dialable;
+  console.log(
+    `[collect-mcp-tools] exclusions: ${optOutSet.count} active rule(s) -- ` +
+    `${optOutTargets.length} of ${corpusSize} endpoints excluded and NOT dialled ` +
+    `(a capture is still written for each, status='excluded')`,
+  );
+
   const sched = new HostScheduler({ deadlineAt });
   for (const t of targets) sched.add({ serverId: t.serverId, url: t.url, host: t.host, attempts: 0 });
   console.log(
@@ -617,6 +664,26 @@ export async function collectMcpTools(): Promise<{
       }
     }
   };
+
+  // Queued BEFORE the sweep starts, so the finally's flush banks them on every
+  // path including an abort. status='excluded' is its own value rather than
+  // not_attempted: that one means the corpus or the deadline stopped us, this one
+  // means a person asked and we agreed. error_class is NULL because no transport
+  // outcome was observed, page_count is 0 because no request was issued, and
+  // tool_count is NULL because the CHECK admits a count only on status='ok'.
+  for (const { target, note } of optOutTargets) {
+    const capture: CaptureRow = {
+      server_id: target.serverId, endpoint_url: target.url,
+      captured_at: new Date().toISOString(),
+      status: 'excluded', http_status: null, response_time_ms: null,
+      error_class: null, tool_count: null, page_count: 0, truncated: false,
+      raw_json: null, raw_bytes: null, token_estimate: null,
+      cache_ttl_ms: null, protocol_version: null, list_changed: null,
+      note: note.slice(0, 400), tools: [],
+    };
+    byStatus[capture.status] = (byStatus[capture.status] ?? 0) + 1;
+    pending.push(capture);
+  }
 
   /** Never throws. Mirrors discoverSafely() in the discover worker. */
   const collectSafely = async (item: Item): Promise<{ capture: CaptureRow; retryAfterMs: number | null }> => {
@@ -716,9 +783,15 @@ export async function collectMcpTools(): Promise<{
     itemsNew: toolsWritten,
     itemsFailed: errors,
     metadata: {
-      endpoints: targets.length, hosts: hs.hosts, by_status: byStatus,
+      // `endpoints` is the CORPUS after TOOLS_LIMIT, not the dialled set:
+      // endpoints - endpoints_excluded_by_operator is what was dialled.
+      endpoints: corpusSize, hosts: hs.hosts, by_status: byStatus,
       captures_written: capturesWritten, tools_written: toolsWritten,
       excluded_by_discover_status: excluded,
+      // Kept separate from the line above on purpose -- corpus filter versus
+      // human decision. See the optOut comment at the load site.
+      endpoints_excluded_by_operator: optOutTargets.length,
+      active_exclusion_rules: optOutSet.count,
       smoke_run: limited, deadline_hit: hs.deadlineHit, undispatched: hs.undispatched,
       max_pages: MAX_PAGES,
       false_drift: drift,
@@ -734,7 +807,10 @@ export async function collectMcpTools(): Promise<{
     );
   }
 
-  console.log(`[collect-mcp-tools] done -- attempted=${seen} captures=${capturesWritten} tools=${toolsWritten} errors=${errors}`);
+  console.log(
+    `[collect-mcp-tools] done -- attempted=${seen} captures=${capturesWritten} tools=${toolsWritten} errors=${errors}` +
+    `${optOutTargets.length > 0 ? ` excluded=${optOutTargets.length} (not dialled, captures written)` : ''}`,
+  );
   console.log(`[collect-mcp-tools] status: ${Object.entries(byStatus).map(([k, v]) => `${k}=${v}`).join(' ') || '(none)'}`);
   console.log(
     `[collect-mcp-tools] false-drift exposure (MEASUREMENT, not a filter): ` +

@@ -98,8 +98,13 @@
  * for smoke tests; unset = full corpus), DISCOVER_CONCURRENCY (default 8).
  */
 
-import { q, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
+import { q, ingestPool, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
+// Operator opt-outs. The matching logic is SHARED with collect-mcp-tools.ts and
+// lives in one module on purpose: an opt-out honoured by one collector and missed
+// by the other is worse than no mechanism, because the operator was told it was
+// handled. See the header of lib/mcp/exclusions.ts.
+import { loadExclusions, isExcluded, exclusionNote } from '../lib/mcp/exclusions';
 import {
   classifyException, classifyStatus, parseRetryAfter, type ErrorClass,
 } from '../lib/mcp/errorClass';
@@ -1065,6 +1070,50 @@ export async function discoverMcpServers(): Promise<{
     limited = true;
   }
 
+  // ── operator opt-outs ─────────────────────────────────────────────────────
+  //
+  // Loaded ONCE, here: after the target set is final and before a single request
+  // leaves this process. Not inside discoverOnce — an excluded endpoint must
+  // never reach the scheduler at all, so "zero requests were sent to it" is a
+  // property of the CONTROL FLOW rather than of a conditional that a later edit
+  // could reorder past the fetch.
+  //
+  // FAIL CLOSED. An unreadable exclusions table aborts the sweep. Skipping a day
+  // costs one day of coverage; dialling an endpoint whose operator asked us to
+  // stop breaks a commitment published at aive.global/mcp-trust/census and cannot
+  // be undone. The scan run is closed on the way out, because the alternative is
+  // the exact failure the 2026-08-11 post-mortem catalogued: a run left at
+  // status='running' with finished_at NULL reads as still in progress to anything
+  // checking freshness, so a deliberate refusal would masquerade as a hang.
+  let exclusionSet;
+  try {
+    exclusionSet = await loadExclusions(ingestPool());
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await closeScanRun(scanId, 0, `failed exclusions_unreadable: ${msg}`.slice(0, 500));
+    throw err;
+  }
+
+  // An excluded target is RECORDED, not dropped. Promise 3 on the disclosure page
+  // is that an opt-out shows up as excluded rather than as a gap: an endpoint that
+  // simply vanished from the sweep would be indistinguishable from coverage loss,
+  // and every percentage computed over the survivors would silently change its
+  // denominator without anything saying so.
+  const corpusSize = items.length;
+  const excludedItems: { item: Item; note: string }[] = [];
+  const dialable: Item[] = [];
+  for (const it of items) {
+    const match = isExcluded({ url: it.url, host: it.host, serverId: it.serverId }, exclusionSet, 'discover');
+    if (match.excluded) excludedItems.push({ item: it, note: exclusionNote(match) });
+    else dialable.push(it);
+  }
+  items = dialable;
+  console.log(
+    `[discover-mcp-servers] exclusions: ${exclusionSet.count} active rule(s) → ` +
+    `${excludedItems.length} of ${corpusSize} endpoints excluded and NOT dialled ` +
+    `(a row is still written for each, discover_status='not_attempted')`,
+  );
+
   // Deadline sits UNDER the workflow's timeout-minutes (180) so the run ends on
   // its own terms and flushes, instead of being killed with a chunk in hand.
   const deadlineParsed = parseLimit(process.env.DISCOVER_DEADLINE_MINUTES, 150);
@@ -1112,6 +1161,33 @@ export async function discoverMcpServers(): Promise<{
       console.error(`[discover-mcp-servers] insert chunk (${chunk.length} rows) failed:`, err instanceof Error ? err.message : err);
     }
   };
+
+  // The excluded rows are queued BEFORE the sweep starts, so they are banked by
+  // the first chunk flush and by the finally on every path — including an abort.
+  // error_class is 'other' because the CHECK vocabulary on
+  // mcp_endpoint_probes.error_class has no value for "we chose not to ask"; the
+  // note carries a stable `excluded:` prefix so the class is queryable without a
+  // schema change:
+  //
+  //     select endpoint_url, note from mcp_endpoint_probes
+  //      where note like 'excluded:%';
+  //
+  // probe_method is NULL for the same reason it is on the template-placeholder
+  // path: no request was made, so recording a method would assert one was.
+  for (const { item, note } of excludedItems) {
+    const row: DiscoverRow = {
+      server_id: item.serverId, endpoint_url: item.url,
+      probed_at: new Date().toISOString(),
+      http_status: null, response_time_ms: null,
+      error_class: 'other', tls_valid: null,
+      note: note.slice(0, 400),
+      probe_method: null, content_type: null,
+      protocol_versions: null, version_source: null,
+      discover_status: 'not_attempted', discover_raw: null,
+    };
+    byStatus[row.discover_status] = (byStatus[row.discover_status] ?? 0) + 1;
+    pending.push(row);
+  }
 
   let seen = 0;
   let thrown = 0;
@@ -1229,6 +1305,10 @@ export async function discoverMcpServers(): Promise<{
     const status =
       `${sweepError ? 'failed' : errors > 0 ? 'error' : 'ok'} attempted=${attempted} written=${written} ${statusStr}` +
       `${thrown > 0 ? ` thrown=${thrown}` : ''}` +
+      // Stated in the run status rather than only in metadata: this is the field a
+      // freshness check reads, and "we chose not to measure N" must be visible
+      // there or a shrinking corpus looks like a shrinking sweep.
+      `${excludedItems.length > 0 ? ` excluded=${excludedItems.length}` : ''}` +
       `${limited ? ' SMOKE' : ''}${hs.deadlineHit ? ` DEADLINE undispatched=${hs.undispatched}` : ''}` +
       `${sweepError ? ` ABORTED: ${sweepError instanceof Error ? `${sweepError.name}: ${sweepError.message}` : String(sweepError)}` : ''}`;
     await closeScanRun(scanId, written, status.slice(0, 500));
@@ -1258,7 +1338,11 @@ export async function discoverMcpServers(): Promise<{
     itemsNew: written,
     itemsFailed: errors,
     metadata: {
-      endpoints: items.length, hosts: hostStats.hosts, by_status: byStatus,
+      // `endpoints` is the CORPUS, not the dialled set, so the two are never
+      // conflated: endpoints - endpoints_excluded is what was dialled.
+      endpoints: corpusSize, endpoints_excluded: excludedItems.length,
+      active_exclusion_rules: exclusionSet.count,
+      hosts: hostStats.hosts, by_status: byStatus,
       total_429: hostStats.total429, hosts_backed_off: hostStats.hostsBackedOff,
       worst_gap_ms: hostStats.worstGapMs, smoke_run: limited,
       deadline_hit: hostStats.deadlineHit, undispatched: hostStats.undispatched,

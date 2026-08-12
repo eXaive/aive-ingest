@@ -11,10 +11,14 @@
     "ingest:mcp-governance": "tsx workers/ingest-mcp-governance.ts",
     "probe:mcp-endpoints": "tsx workers/probe-mcp-endpoints.ts",
     "discover:mcp-servers": "tsx workers/discover-mcp-servers.ts",
+    "collect:mcp-tools": "tsx workers/collect-mcp-tools.ts",
     "verify:host-backoff": "tsx scripts/verify-host-backoff.ts",
     "typecheck": "tsc --noEmit",
     "verify:rejection-parsing": "tsx scripts/verify-rejection-parsing.ts",
-    "verify:write-access": "tsx scripts/verify-write-access.ts"
+    "verify:write-access": "tsx scripts/verify-write-access.ts",
+    "verify:tools-collector": "tsx scripts/verify-tools-collector.ts",
+    "verify:throw-isolation": "tsx scripts/verify-throw-isolation.ts",
+    "verify:exclusions": "tsx scripts/verify-exclusions.ts"
   },
   "dependencies": {
     "pg": "^8.22.0"
