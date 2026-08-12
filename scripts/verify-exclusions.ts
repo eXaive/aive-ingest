@@ -90,7 +90,7 @@ globalThis.fetch = (async (input: any, init?: any) => {
 
 /* ── database double ─────────────────────────────────────────────────────── */
 interface WrittenProbe { endpoint_url: string; discover_status: string; note: string | null; probe_method: string | null; error_class: string }
-interface WrittenCapture { endpoint_url: string; status: string; note: string | null; page_count: number; tool_count: number | null; error_class: string | null }
+interface WrittenCapture { endpoint_url: string; status: string; note: string | null; page_count: number; tool_count: number | null; error_class: string | null; scan_run_id: string | null }
 
 const written = { probes: [] as WrittenProbe[], captures: [] as WrittenCapture[], scanRunStatus: null as string | null };
 /** Flipped by the fail-closed phase; loadExclusions must then refuse. */
@@ -147,6 +147,10 @@ const fakeDb = {
         error_class: p[6] === null || p[6] === undefined ? null : String(p[6]),
         tool_count: p[7] === null || p[7] === undefined ? null : Number(p[7]),
         page_count: Number(p[8]), note: p[16] === null || p[16] === undefined ? null : String(p[16]),
+        // $18. Read positionally from the parameter array the worker actually
+        // sends, so this observes the shipping INSERT rather than trusting that
+        // the column list and the values stayed in step.
+        scan_run_id: p[17] === null || p[17] === undefined ? null : String(p[17]),
       });
       return [{ id: `cap-${written.captures.length}` }];
     }
@@ -272,6 +276,27 @@ async function main(): Promise<void> {
   check('the exclusion set is loaded exactly ONCE per run', exclusionLoads === 1, `${exclusionLoads} load(s)`);
   check('every target produced exactly one capture', written.captures.length === 3, `${written.captures.length} for 3 targets`);
   check('excluded captures count toward captures written', tres.captures === 3, `captures=${tres.captures}`);
+
+  /* ── scan_run_id: a bounded or partial run must be identifiable from the
+   * capture rows ALONE. Read off the INSERT parameters the worker actually
+   * sent -- $18 by position -- so a column list that drifted out of step with
+   * its values would fail here rather than write NULLs in production. */
+  const runIds = written.captures.map((c) => c.scan_run_id);
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  console.log(`  scan_run_id on each capture: ${runIds.map((r) => (r ?? 'NULL')).join(', ')}`);
+  check('every capture carries a non-NULL scan_run_id', runIds.every((r) => r !== null && r !== 'null'));
+  check('scan_run_id is a well-formed UUID', runIds.every((r) => !!r && UUID_RE.test(r)), String(runIds[0]));
+  check('all captures in ONE run share ONE scan_run_id', new Set(runIds).size === 1, `${new Set(runIds).size} distinct`);
+  check('the EXCLUDED captures are stamped too (they use the same write path)',
+    written.captures.filter((c) => c.status === 'excluded').every((c) => c.scan_run_id === runIds[0]),
+    `${written.captures.filter((c) => c.status === 'excluded').length} excluded rows`);
+  // Two runs must not collide, or grouping by the column proves nothing.
+  const firstRunId = runIds[0];
+  written.captures = [];
+  await tools.collectMcpTools();
+  const secondRunId = written.captures[0]?.scan_run_id ?? null;
+  check('a SECOND run gets a DIFFERENT scan_run_id', !!secondRunId && secondRunId !== firstRunId,
+    `${firstRunId} vs ${secondRunId}`);
 
   /* ── 3. fail closed ───────────────────────────────────────────────────── */
   section('fail closed: mcp_exclusions unreadable');

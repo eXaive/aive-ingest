@@ -49,6 +49,7 @@
  * TOOLS_CONCURRENCY (default 8), TOOLS_DEADLINE_MINUTES (default 60).
  */
 
+import { randomUUID } from 'node:crypto';
 import { q, ingestPool, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
 // Operator opt-outs, SHARED with discover-mcp-servers.ts. Not a second copy of
@@ -506,6 +507,36 @@ export async function collectMcpTools(): Promise<{
   const startedAt = new Date();
   let errors = 0;
 
+  /**
+   * ONE ID PER RUN, stamped on every capture row.
+   *
+   * WHY THIS EXISTS. Before it, a bounded run and a full sweep that died at its
+   * deadline were indistinguishable from mcp_tool_captures alone: both leave a
+   * partial set of rows with nothing saying which they were. The only marker was
+   * ingestion_log.metadata.smoke_run, reachable solely by joining on a TIME
+   * WINDOW -- inference from a timestamp, not a recorded fact. Anyone counting
+   * captures per day and dividing by the target set would silently mix a
+   * 10-endpoint smoke test into a coverage figure. Surfaced by the 2026-08-12
+   * smoke run, which is exactly what a smoke run is for.
+   *
+   * WHY IT IS NOT A scan_runs ROW, despite the column being called scan_run_id.
+   * scan_runs has NO source/worker column and SIX workers already insert into
+   * it; lib/mcp/pipelineStreak.ts in aive-platform documents that it therefore
+   * cannot express "a successful scan_run" for any one worker, and chose
+   * ingestion_log for exactly that reason. config/data-freshness.ts registers
+   * scan_runs.started_at against the registry ingest. Adding a seventh
+   * undiscriminable writer would corrupt both readers to buy a grouping key.
+   * There is no FK on mcp_tool_captures.scan_run_id (checked, not assumed), so
+   * the column can carry a run identifier that is real without being a
+   * scan_runs primary key. The name is inherited and now inaccurate -- a column
+   * comment saying so is a follow-up in the platform repo.
+   *
+   * The same value goes into the ingestion_log metadata as run_id, so the join
+   * from capture rows to the run that produced them is by a recorded value
+   * rather than by a timestamp guess.
+   */
+  const RUN_ID = randomUUID();
+
   const concurrencyParsed = parseLimit(process.env.TOOLS_CONCURRENCY, DEFAULT_CONCURRENCY);
   if (!concurrencyParsed.ok || concurrencyParsed.value === null) {
     throw new Error(`TOOLS_CONCURRENCY unreadable: ${concurrencyParsed.problem}`);
@@ -592,13 +623,16 @@ export async function collectMcpTools(): Promise<{
     `concurrency ${concurrency}, per-host gap ${sched.baseGapMs}ms adaptive to ${sched.maxGapMs}ms, ` +
     `deadline ${deadlineParsed.value}min, MAX_PAGES ${MAX_PAGES}`,
   );
+  // Printed so the Actions log and the rows can be tied together from either
+  // end: this id is on every capture row and in the ingestion_log metadata.
+  console.log(`[collect-mcp-tools] run_id ${RUN_ID}${limited ? ' (BOUNDED RUN)' : ''}`);
 
-  const CAP_COLS = [
-    'server_id', 'endpoint_url', 'captured_at', 'status', 'http_status',
-    'response_time_ms', 'error_class', 'tool_count', 'page_count', 'truncated',
-    'raw_json', 'raw_bytes', 'token_estimate', 'cache_ttl_ms',
-    'protocol_version', 'list_changed',
-  ];
+  // CAP_COLS used to sit here, listing sixteen capture columns, and nothing read
+  // it -- the capture INSERT below names its own columns because it needs
+  // RETURNING id. Removed rather than extended: a dead column list that no longer
+  // matches the live INSERT is worse than no list, because the next person to add
+  // a column updates the array, sees the tests pass, and never touches the
+  // statement that actually runs.
   const TOOL_COLS = [
     'capture_id', 'server_id', 'endpoint_url', 'tool_name', 'tool_title',
     'description', 'input_schema', 'output_schema', 'schema_hash',
@@ -630,8 +664,8 @@ export async function collectMcpTools(): Promise<{
              (server_id, endpoint_url, captured_at, status, http_status,
               response_time_ms, error_class, tool_count, page_count, truncated,
               raw_json, raw_bytes, token_estimate, cache_ttl_ms,
-              protocol_version, list_changed, note)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+              protocol_version, list_changed, note, scan_run_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
            RETURNING id`,
           [
             c.server_id, c.endpoint_url, c.captured_at, c.status, c.http_status,
@@ -639,6 +673,11 @@ export async function collectMcpTools(): Promise<{
             c.raw_json === null ? null : JSON.stringify(c.raw_json),
             c.raw_bytes, c.token_estimate, c.cache_ttl_ms,
             c.protocol_version, c.list_changed, c.note,
+            // Stamped from the closure, not per row, so every capture in a run
+            // carries the same value by construction -- including the excluded
+            // ones and the probe_exception ones, which flow through this same
+            // path. A per-row field could diverge; a closure constant cannot.
+            RUN_ID,
           ],
         );
         capturesWritten++;
@@ -783,6 +822,11 @@ export async function collectMcpTools(): Promise<{
     itemsNew: toolsWritten,
     itemsFailed: errors,
     metadata: {
+      // The join key. Every capture row this run wrote carries scan_run_id =
+      // run_id, so "which run produced these rows" is answerable without a
+      // time-window join, and smoke_run below applies to a set of rows that can
+      // be named rather than inferred.
+      run_id: RUN_ID,
       // `endpoints` is the CORPUS after TOOLS_LIMIT, not the dialled set:
       // endpoints - endpoints_excluded_by_operator is what was dialled.
       endpoints: corpusSize, hosts: hs.hosts, by_status: byStatus,
