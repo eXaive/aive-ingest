@@ -18,17 +18,51 @@
 #
 # CRON 08:00Z, and the slot is load-bearing in one direction: it must run AFTER
 # the discover sweep whose rows define this worker's target set.
-#   03:00Z  discover sweep starts (discover-mcp-servers.yml), worker deadline
-#           150min and job timeout 180min, so it can still be writing at 06:00Z
-#   05:00–06:15Z  the ingest block
-#   07:00Z  reachability sweep (probe-mcp-endpoints.yml)
-#   08:00Z  THIS — two hours clear of discover's worst case, clear of the
-#           ingest block, and after the reachability sweep
+#
+# MEASURED, NOT ASSUMED — corrected 2026-08-12. This header previously derived
+# the slot from "discover starts at 03:00Z with a 150-minute worker deadline and
+# a 180-minute job timeout, so it can still be writing at 06:00Z". Both halves
+# were wrong, in opposite directions, and the conclusion survived only by luck.
+# What the last runs actually did:
+#
+#   run 31564082139  schedule  started 04:41Z  finished 04:59Z   17m48s
+#   run 31457744958  schedule  started 04:12Z  finished 04:14Z    2m15s  (failed)
+#   run 31487138167  dispatch  started 11:33Z  finished 11:46Z   13m08s
+#
+#   - THE CRON DOES NOT FIRE AT 03:00Z. GitHub delivered '0 3 * * *' at 04:41Z
+#     and at 04:12Z: 72 to 101 minutes late. Scheduled workflows are best-effort
+#     and delay of this size is normal on a metered account.
+#   - THE RUN IS NOT 150 MINUTES. It takes about 18. The 150-minute worker
+#     deadline is a ceiling that has never been approached, so the old estimate
+#     was pessimistic by roughly 8x.
+#
+# So THE BINDING CONSTRAINT IS CRON JITTER, NOT RUN LENGTH. Worst observed
+# discover completion is 04:59Z, which leaves about 3 hours of headroom before
+# 08:00Z. For this collector to overtake discover, discover would have to still
+# be running at 08:00Z -- i.e. start after ~07:42Z, a delay of 4h42m against the
+# 72-101min observed. The margin is roughly three hours beyond anything seen.
+# The jitter is also symmetric: this workflow's own 08:00Z cron will arrive late
+# by a similar amount, which pushes it FURTHER from discover, not closer.
+#
+#   ~04:12-04:41Z  discover sweep actually starts (cron fires late)
+#   ~04:59Z        worst observed discover completion
+#   05:00-06:15Z   the ingest block
+#   07:00Z         reachability sweep (probe-mcp-endpoints.yml)
+#   08:00Z         THIS -- ~3h clear of discover's worst observed completion,
+#                  clear of the ingest block, after the reachability sweep
+#
 # Running this BEFORE the discover sweep would read yesterday's target set,
 # which is not wrong so much as silently one day stale. The reachability
 # ordering that matters to discover-mcp-servers.yml does not apply here: this
 # worker writes mcp_tool_captures, never mcp_endpoint_probes, so it cannot
 # re-base the published OBSERVED/BLOCK counts onto POST outcomes.
+#
+# IF THE JITTER EVER GROWS, this is the number to re-measure rather than a
+# comment to trust: compare the newest finished discover run's finished_at
+# against 08:00Z. The worker is not defenceless either -- it locates its target
+# run by the most recent FINISHED scan_run containing discover rows, so an
+# overlap degrades to reading yesterday's set rather than reading a half-written
+# one.
 #
 # The target run is located by the same self-validating rule mcp_discover_census
 # uses — the most recent FINISHED scan_run that actually contains discover rows
@@ -84,11 +118,24 @@ name: MCP tools/list Collection
 #    collectors, and verified — 58 worker-side checks and 13 SQL-side checks.
 #    No request has arrived yet. This is the "before" case.
 #
-# THE FIRST SCHEDULED RUN IS THE SECOND CAPTURE, and it comes from the schedule.
-# The first capture was a single deliberate sweep on 2026-08-12 (360 attempted,
-# 360 captures, 243 ok, 3,279 tools). No manual dispatch is fired ahead of the
-# 08:00Z cron, so the cadence an operator observes in their logs matches the
-# once-daily rhythm the disclosure page describes rather than a burst.
+# WHAT HAS ACTUALLY RUN, in order, so the corpus and an operator's access log can
+# both be reconciled against this file rather than against a memory of it:
+#
+#   1. 2026-08-12  the first capture, a single deliberate local sweep, not from
+#      this workflow: 360 attempted, 360 captures, 243 ok, 3,279 tools.
+#   2. 2026-08-12  ONE BOUNDED DISPATCH of this workflow, tools_limit=10, to
+#      smoke-test it end to end -- secret resolution, npm run collect:mcp-tools,
+#      target-set location, the exclusion load, and the write path. 10 endpoints
+#      dialled, 10 captures, 90 tools, 0 errors, 19s. Run 31647218145.
+#   3. the 08:00Z cron is THE FIRST UNBOUNDED SCHEDULED RUN.
+#
+# An earlier version of this header said "No manual dispatch is fired ahead of
+# the 08:00Z cron". That was true when written and the smoke test made it false,
+# so it is corrected here rather than left to be believed. The reason the claim
+# was made at all still stands and still shapes the choice: the disclosure page
+# describes a once-daily rhythm, so the bounded run was capped at 10 endpoints
+# instead of the full 358 precisely to keep the extra traffic negligible, and no
+# further dispatch precedes the cron.
 #
 # TO PAUSE: re-comment the two `schedule`/`cron` lines. workflow_dispatch stays
 # ACTIVE either way, so a bounded run is always available from the Actions tab
