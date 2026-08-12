@@ -1,0 +1,143 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# MCP tools/list collection — one tools/list POST per current-spec endpoint.
+#
+# Sends exactly one JSON-RPC request per endpoint, plus one per extra cursor
+# page:
+#   {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{…}}}
+# `params` is REQUIRED on a PaginatedRequest (schema.ts:1063-1065) and `_meta`
+# is required inside it; `cursor` is added only on follow-up pages. NO
+# initialize handshake, NO Mcp-Session-Id sent or read, NO Authorization, no
+# cookies. NO tools/call — this worker reads definitions and stops at the
+# definition. It never invokes a tool.
+#
+# TARGET SET is the endpoints whose latest discover row in the reference sweep
+# says discover_status='ok' — 360 URLs of 11,109 probed. session_required is a
+# DIFFERENT status and is therefore excluded by construction rather than by a
+# filter that could be forgotten; the worker asserts it at startup anyway,
+# because the disclosure page promises it.
+#
+# CRON 08:00Z, and the slot is load-bearing in one direction: it must run AFTER
+# the discover sweep whose rows define this worker's target set.
+#   03:00Z  discover sweep starts (discover-mcp-servers.yml), worker deadline
+#           150min and job timeout 180min, so it can still be writing at 06:00Z
+#   05:00–06:15Z  the ingest block
+#   07:00Z  reachability sweep (probe-mcp-endpoints.yml)
+#   08:00Z  THIS — two hours clear of discover's worst case, clear of the
+#           ingest block, and after the reachability sweep
+# Running this BEFORE the discover sweep would read yesterday's target set,
+# which is not wrong so much as silently one day stale. The reachability
+# ordering that matters to discover-mcp-servers.yml does not apply here: this
+# worker writes mcp_tool_captures, never mcp_endpoint_probes, so it cannot
+# re-base the published OBSERVED/BLOCK counts onto POST outcomes.
+#
+# The target run is located by the same self-validating rule mcp_discover_census
+# uses — the most recent FINISHED scan_run that actually contains discover rows
+# inside its own window — so the 07:00Z HEAD sweep cannot be mistaken for the
+# reference run even though it writes to the same table.
+#
+# OPERATOR EXCLUSIONS ARE HONOURED AND THE WORKER FAILS CLOSED. It loads
+# public.mcp_exclusions once, after the target set is final and before any dial,
+# and REFUSES TO RUN if that table is unreadable. A red run here can therefore
+# mean "we could not confirm who asked us to stop", which is a deliberate
+# outcome: skipping a day costs one day of coverage, while dialling an endpoint
+# whose operator opted out breaks a commitment published at
+# https://aive.global/mcp-trust/census and cannot be undone. Excluded endpoints
+# still get a capture row with status='excluded', so they are reported as
+# excluded rather than disappearing into a smaller denominator.
+#
+# Per-host adaptive pacing: HostScheduler is imported from
+# discover-mcp-servers.ts and used UNMODIFIED — work queued per host,
+# round-robin dispatch, per-host concurrency 1, and a 429 raises THAT HOST's gap
+# and defers only that host.
+#
+# Exits non-zero on insert errors OR on a completed run that wrote ZERO
+# captures — every outcome including every failure is a capture row, so zero
+# captures means the write path never worked. The red Actions run IS the alert.
+#
+# Triggers: schedule + workflow_dispatch ONLY. No push, no pull_request, no
+# pull_request_target — this is a PUBLIC repo and this workflow holds a database
+# credential, so it must be unreachable from forks and from PR events.
+#
+# Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role;
+# pooler host aws-1-us-east-1, NOT aws-0 — aws-0 fails "Tenant or user not
+# found"). No service role key. Nothing else.
+# ═══════════════════════════════════════════════════════════════════════════
+name: MCP tools/list Collection
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ▶ SCHEDULE ON since 2026-08-12, after two preconditions were met, in order.
+#
+# 1. DISCLOSURE, which gated writing this worker at all. The census page
+#    previously read "server/discover is the only method we issue"; issuing a
+#    second method while that sentence was live would have made a published
+#    commitment false for every operator who had already read it. The page was
+#    amended FIRST (aive-platform d48d005, merged 7c110fc, verified live: 200,
+#    no redirect, two-method sentence present) and carries this collector's
+#    User-Agent verbatim. If a third method is ever added, the page changes
+#    first, again.
+#
+# 2. THE EXCLUSION MECHANISM, which discover-mcp-servers.yml recorded as an
+#    open gap when IT was enabled: "there is no exclusions table in the schema
+#    and no skip path in this worker beyond deleted servers … Build it before
+#    the first request arrives, not after one has been mishandled." It is built
+#    (aive-platform 20260812000007, lib/mcp/exclusions.ts here), shared by both
+#    collectors, and verified — 58 worker-side checks and 13 SQL-side checks.
+#    No request has arrived yet. This is the "before" case.
+#
+# THE FIRST SCHEDULED RUN IS THE SECOND CAPTURE, and it comes from the schedule.
+# The first capture was a single deliberate sweep on 2026-08-12 (360 attempted,
+# 360 captures, 243 ok, 3,279 tools). No manual dispatch is fired ahead of the
+# 08:00Z cron, so the cadence an operator observes in their logs matches the
+# once-daily rhythm the disclosure page describes rather than a burst.
+#
+# TO PAUSE: re-comment the two `schedule`/`cron` lines. workflow_dispatch stays
+# ACTIVE either way, so a bounded run is always available from the Actions tab
+# (use the tools_limit input).
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      tools_limit:
+        description: 'Cap endpoint count (smoke run). Leave empty for the full target set.'
+        required: false
+        type: string
+
+concurrency:
+  group: collect-mcp-tools
+  cancel-in-progress: false
+
+# Least privilege: this job reads the repo and nothing else. No packages, no
+# id-token, no write scopes of any kind.
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    # Sits ABOVE the worker's own deadline (TOOLS_DEADLINE_MINUTES, default 60)
+    # so the run ends on its own terms and flushes its pending chunk, instead of
+    # being killed by the runner with captures in hand. That margin is the whole
+    # point of the gap: on 2026-08-11 a sweep died holding a 500-row chunk that
+    # had already been probed, and the endpoints in it were dialled for nothing.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Collect tools/list
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          TOOLS_LIMIT: ${{ inputs.tools_limit }}
+        run: npm run collect:mcp-tools
