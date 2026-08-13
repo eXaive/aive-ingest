@@ -186,6 +186,11 @@ on:
         description: 'prompts/list: cap endpoint count (smoke run). Empty = full target set.'
         required: false
         type: string
+      skip_tools:
+        description: 'tools/list: skip it entirely. Use when smoke-testing resources/list or prompts/list, so the bounded run does not append to the tools series.'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: collect-mcp-tools
@@ -249,8 +254,16 @@ jobs:
       # method with a run history, so if the shared dispatch loop has regressed,
       # the failure shows up against the collector we have a baseline for.
 
+      # SKIPPABLE, and only this one. The three collectors share a job, so a
+      # bounded dispatch aimed at resources/list or prompts/list would otherwise
+      # append a capture to the TOOLS series as a side effect of testing
+      # something else -- measured on run #3, which added 1 tools capture while
+      # proving the listing grants. Append-only means that row can never be
+      # removed, so the fix is not to write it. On schedule the inputs context
+      # is empty, so this evaluates true and the step runs exactly as before.
       - name: Collect tools/list
         id: tools
+        if: inputs.skip_tools != true
         continue-on-error: true
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
