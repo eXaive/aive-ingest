@@ -1,14 +1,38 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# MCP tools/list collection — one tools/list POST per current-spec endpoint.
+# MCP listing collection — THREE METHODS, one POST each per current-spec
+# endpoint: tools/list, then resources/list, then prompts/list.
 #
-# Sends exactly one JSON-RPC request per endpoint, plus one per extra cursor
-# page:
-#   {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{…}}}
+# Sends exactly one JSON-RPC request per endpoint PER METHOD, plus one per extra
+# cursor page:
+#   {"jsonrpc":"2.0","id":1,"method":"<method>","params":{"_meta":{…}}}
 # `params` is REQUIRED on a PaginatedRequest (schema.ts:1063-1065) and `_meta`
 # is required inside it; `cursor` is added only on follow-up pages. NO
 # initialize handshake, NO Mcp-Session-Id sent or read, NO Authorization, no
-# cookies. NO tools/call — this worker reads definitions and stops at the
-# definition. It never invokes a tool.
+# cookies.
+#
+# NO tools/call, NO resources/read, NO prompts/get. All three workers read
+# DECLARATIONS and stop at the declaration: tools/list returns schemas,
+# resources/list returns URIs and MIME types (never contents), prompts/list
+# returns declared arguments (never rendered text). A listing is not an access.
+#
+# RESOURCES AND PROMPTS HAVE NEVER BEEN DIALLED. Not once, not bounded, not
+# locally. They were built against fixtures only; the DB-level checks ran inside
+# a transaction that rolled back. The 08:00Z cron is the FIRST time either
+# method reaches a real endpoint. tools/list, by contrast, has run before -- see
+# the run history below.
+#
+# THE DISCLOSURE AMENDMENT THAT GATED THEM: aive-platform cc4684d, live and
+# verified (200, no redirect chain). It states a CLOSED SET OF FOUR methods,
+# renders all four User-Agent strings, and -- because the collectors did not
+# exist when it shipped -- says in terms that resources/list and prompts/list
+# were not yet in service. That note is what this run makes stale, and deleting
+# it is the follow-up to the first green run here.
+#
+# THREE METHODS MEANS THREE AGENTS, not one shared string. An operator grepping
+# their log sees AIVE-MCP-Tools, AIVE-MCP-Resources or AIVE-MCP-Prompts and
+# knows which method reached them without reading anything. All three are
+# rendered on the census page and their bytes are asserted against it in
+# scripts/verify-list-collectors.ts.
 #
 # TARGET SET is the endpoints whose latest discover row in the reference sweep
 # says discover_status='ok' — 360 URLs of 11,109 probed. session_required is a
@@ -96,7 +120,7 @@
 # pooler host aws-1-us-east-1, NOT aws-0 — aws-0 fails "Tenant or user not
 # found"). No service role key. Nothing else.
 # ═══════════════════════════════════════════════════════════════════════════
-name: MCP tools/list Collection
+name: MCP Listing Collection (tools, resources, prompts)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ▶ SCHEDULE ON since 2026-08-12, after two preconditions were met, in order.
@@ -128,6 +152,10 @@ name: MCP tools/list Collection
 #      target-set location, the exclusion load, and the write path. 10 endpoints
 #      dialled, 10 captures, 90 tools, 0 errors, 19s. Run 31647218145.
 #   3. the 08:00Z cron is THE FIRST UNBOUNDED SCHEDULED RUN.
+#   4. 2026-08-13  resources/list and prompts/list added as sequential steps in
+#      THIS job. Neither has ever been dialled, by this workflow or otherwise,
+#      and no dispatch precedes the cron for either. Their first contact with a
+#      real endpoint is the same 08:00Z cron.
 #
 # An earlier version of this header said "No manual dispatch is fired ahead of
 # the 08:00Z cron". That was true when written and the smoke test made it false,
@@ -147,7 +175,15 @@ on:
   workflow_dispatch:
     inputs:
       tools_limit:
-        description: 'Cap endpoint count (smoke run). Leave empty for the full target set.'
+        description: 'tools/list: cap endpoint count (smoke run). Empty = full target set.'
+        required: false
+        type: string
+      resources_limit:
+        description: 'resources/list: cap endpoint count (smoke run). Empty = full target set.'
+        required: false
+        type: string
+      prompts_limit:
+        description: 'prompts/list: cap endpoint count (smoke run). Empty = full target set.'
         required: false
         type: string
 
@@ -163,12 +199,18 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    # Sits ABOVE the worker's own deadline (TOOLS_DEADLINE_MINUTES, default 60)
-    # so the run ends on its own terms and flushes its pending chunk, instead of
-    # being killed by the runner with captures in hand. That margin is the whole
-    # point of the gap: on 2026-08-11 a sweep died holding a 500-row chunk that
-    # had already been probed, and the endpoints in it were dialled for nothing.
-    timeout-minutes: 90
+    # Sits ABOVE the SUM of the three workers' own deadlines
+    # (TOOLS_/RESOURCES_/PROMPTS_DEADLINE_MINUTES, 60 each = 180) so every sweep
+    # ends on its own terms and flushes its pending chunk, instead of being
+    # killed by the runner with captures in hand. That margin is the whole point
+    # of the gap: on 2026-08-11 a sweep died holding a 500-row chunk that had
+    # already been probed, and the endpoints in it were dialled for nothing.
+    #
+    # Raised 90 -> 210 for the two added sweeps. The ceiling is not the
+    # expectation: tools/list takes about 18 minutes over 360 endpoints and the
+    # other two address the SAME 360, so ~55 minutes is the realistic figure and
+    # 180 is a ceiling none of the three has approached.
+    timeout-minutes: 210
 
     steps:
       - name: Checkout
@@ -183,8 +225,70 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ── THE THREE SWEEPS, IN ORDER, ISOLATED FROM EACH OTHER ────────────────
+      #
+      # continue-on-error on each collector is what makes them independent: a
+      # prompts/list failure must not throw away a tools/list capture that
+      # already succeeded and is already written. Without it, the first non-zero
+      # exit ends the job and the remaining methods are never dialled -- so one
+      # flaky method would silently cost coverage on the other two.
+      #
+      # `if: always()` on the second and third is the same rule stated the other
+      # way: run even if an earlier step failed. continue-on-error alone would
+      # already allow that, and both are present because they answer different
+      # questions and a later edit could remove either.
+      #
+      # NO HOLLOW GREEN. continue-on-error would otherwise let the job report
+      # success while a sweep failed, which is the exact failure mode the
+      # zero-captures check inside each worker exists to prevent. The gate step
+      # at the end re-reads all three outcomes and fails the job if any of them
+      # failed, so the run is still RED and the alert still fires -- it just
+      # fires after all three have had their turn.
+      #
+      # Order is load-bearing only in that tools/list runs first: it is the
+      # method with a run history, so if the shared dispatch loop has regressed,
+      # the failure shows up against the collector we have a baseline for.
+
       - name: Collect tools/list
+        id: tools
+        continue-on-error: true
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
           TOOLS_LIMIT: ${{ inputs.tools_limit }}
         run: npm run collect:mcp-tools
+
+      - name: Collect resources/list
+        id: resources
+        continue-on-error: true
+        if: always()
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          RESOURCES_LIMIT: ${{ inputs.resources_limit }}
+        run: npm run collect:mcp-resources
+
+      - name: Collect prompts/list
+        id: prompts
+        continue-on-error: true
+        if: always()
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          PROMPTS_LIMIT: ${{ inputs.prompts_limit }}
+        run: npm run collect:mcp-prompts
+
+      # Re-imposes failure AFTER all three have run. Each outcome is printed so
+      # the log says which method failed without opening three step panes.
+      - name: Fail if any collector failed
+        if: always()
+        run: |
+          echo "tools/list     : ${{ steps.tools.outcome }}"
+          echo "resources/list : ${{ steps.resources.outcome }}"
+          echo "prompts/list   : ${{ steps.prompts.outcome }}"
+          failed=0
+          [ "${{ steps.tools.outcome }}" = "failure" ] && failed=1
+          [ "${{ steps.resources.outcome }}" = "failure" ] && failed=1
+          [ "${{ steps.prompts.outcome }}" = "failure" ] && failed=1
+          if [ "$failed" = "1" ]; then
+            echo "::error::at least one collector failed -- the other sweeps still ran and their captures are written"
+            exit 1
+          fi
+          echo "all three collectors succeeded"
