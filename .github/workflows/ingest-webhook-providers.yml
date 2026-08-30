@@ -6,9 +6,9 @@
 # Exits non-zero on ingest errors or a stale snapshot stream (in-worker
 # tripwire). The red Actions run IS the alert.
 #
-# No GITHUB_TOKEN is passed: the worker makes ~2 tree-listing API calls per
-# run (fits unauthenticated limits) and fetches file contents from
-# raw.githubusercontent.com, which is not API-metered.
+# GitHub's automatic token is passed only to the provider scan step. It is
+# used only for api.github.com tree/metadata reads; raw content requests are
+# deliberately unauthenticated.
 #
 # Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
 # workflow holds a database credential and must not be reachable from forks.
@@ -17,6 +17,9 @@
 # six tables, no delete). Nothing else.
 # ═══════════════════════════════════════════════════════════════════════════
 name: Webhook Providers Ingest
+
+permissions:
+  contents: read
 
 on:
   schedule:
@@ -48,4 +51,5 @@ jobs:
       - name: Run webhook providers scan
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: npx tsx workers/ingest-webhook-providers.ts

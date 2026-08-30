@@ -40,6 +40,12 @@ const FETCH_TIMEOUT_MS = 20_000;
 const RAW_CONCURRENCY = 8;
 /** Cap on raw-content fetches per source repo; dropped counts are logged. */
 const CONTENT_FETCH_CAP = 400;
+export const WEBHOOK_PROVIDER_REQUEST_BOUNDS = Object.freeze({
+  githubApiCalls: 8,
+  rawFetchesPerSource: CONTENT_FETCH_CAP,
+  sources: 2,
+  rawConcurrency: RAW_CONCURRENCY,
+});
 
 /** Freshness tripwire threshold (hours). Same posture as the MCP worker's
  *  48h snapshot tripwire, but keyed on registry_artifacts.last_seen instead
@@ -108,23 +114,64 @@ function classifyProviderType(source: 'pipedream' | 'n8n', pathSegment: string):
 let apiCalls = 0;
 let rawFetches = 0;
 
-function ghHeaders(): Record<string, string> {
+export function ghHeaders(token = process.env.GITHUB_TOKEN): Record<string, string> {
   const h: Record<string, string> = {
     'Accept': 'application/vnd.github+json',
     'User-Agent': 'aive-webhook-provider-ingest',
   };
-  const token = process.env.GITHUB_TOKEN;
   if (token) h['Authorization'] = `Bearer ${token}`;
   return h;
 }
 
+type GitHubFailureClass =
+  | 'AUTHENTICATION_REJECTED'
+  | 'RATE_LIMITED'
+  | 'ACCESS_FORBIDDEN'
+  | 'NOT_FOUND'
+  | 'UPSTREAM_FAILURE'
+  | 'REQUEST_REJECTED';
+
+function sanitizedHeader(headers: Headers, name: string): string {
+  const value = headers.get(name);
+  return value && /^\d{1,20}$/.test(value) ? value : 'unavailable';
+}
+
+export function classifyGitHubFailure(status: number, headers: Headers): GitHubFailureClass {
+  if (status === 401) return 'AUTHENTICATION_REJECTED';
+  if (status === 429 || (status === 403 && headers.get('x-ratelimit-remaining') === '0')) return 'RATE_LIMITED';
+  if (status === 403) return 'ACCESS_FORBIDDEN';
+  if (status === 404) return 'NOT_FOUND';
+  if (status >= 500) return 'UPSTREAM_FAILURE';
+  return 'REQUEST_REJECTED';
+}
+
+export function sanitizedGitHubFailure(path: string, status: number, headers: Headers): string {
+  return [
+    `GitHub API ${path}: HTTP ${status}`,
+    `classification=${classifyGitHubFailure(status, headers)}`,
+    `x-ratelimit-limit=${sanitizedHeader(headers, 'x-ratelimit-limit')}`,
+    `x-ratelimit-remaining=${sanitizedHeader(headers, 'x-ratelimit-remaining')}`,
+    `x-ratelimit-reset=${sanitizedHeader(headers, 'x-ratelimit-reset')}`,
+    `retry-after=${sanitizedHeader(headers, 'retry-after')}`,
+  ].join(' ');
+}
+
+export function githubApiRequest(path: string, token = process.env.GITHUB_TOKEN): [string, RequestInit] {
+  if (!path.startsWith('/') || path.startsWith('//')) throw new Error('GitHub API path rejected');
+  const url = new URL(path, GITHUB_API);
+  if (url.origin !== GITHUB_API) throw new Error('GitHub API origin rejected');
+  return [url.toString(), {
+    headers: ghHeaders(token),
+    redirect: 'error',
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  }];
+}
+
 async function ghJson<T>(path: string): Promise<T> {
   apiCalls++;
-  const res = await fetch(`${GITHUB_API}${path}`, {
-    headers: ghHeaders(),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`GitHub API ${path}: HTTP ${res.status}`);
+  const [url, init] = githubApiRequest(path);
+  const res = await fetch(url, init);
+  if (!res.ok) throw new Error(sanitizedGitHubFailure(path, res.status, res.headers));
   return (await res.json()) as T;
 }
 
