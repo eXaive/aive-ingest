@@ -21,7 +21,8 @@
     "verify:write-access": "tsx scripts/verify-write-access.ts",
     "verify:tools-collector": "tsx scripts/verify-tools-collector.ts",
     "verify:throw-isolation": "tsx scripts/verify-throw-isolation.ts",
-    "verify:exclusions": "tsx scripts/verify-exclusions.ts"
+    "verify:exclusions": "tsx scripts/verify-exclusions.ts",
+    "verify:mcp-registry-outcome": "tsx scripts/verify-mcp-registry-outcome.ts"
   },
   "dependencies": {
     "pg": "^8.22.0"

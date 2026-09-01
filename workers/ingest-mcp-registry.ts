@@ -34,6 +34,15 @@ import { createHash }   from 'crypto';
 import { q, upsertRows, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
 import { hashCanonical } from '../lib/mcp/canonicalize';
 import { parseLimit } from "../lib/ingest/parseLimit";
+import {
+  buildRegistryOutcome,
+  classifyCacheRefreshError,
+  exitCodeForRegistryOutcome,
+  type CacheRefreshHealth,
+  type CacheRefreshErrorClass,
+  type CacheRefreshStatus,
+  type RegistryOutcome,
+} from '../lib/ingest/mcpRegistryOutcome';
 
 const REGISTRY_BASE = 'https://registry.modelcontextprotocol.io/v0.1';
 const PAGE_LIMIT    = 100;
@@ -308,8 +317,8 @@ export async function ingestMCPRegistry(
 ): Promise<{
   fetched: number; filtered: number; pages: number; upserted: number; snapshots: number;
   mode: 'full' | 'delta'; updated_since: string | null;
-  errors: number; first_error: string | null; elapsed_ms: number;
-}> {
+  ingest_elapsed_ms: number; total_elapsed_ms: number;
+} & RegistryOutcome> {
   const mode = opts.mode ?? 'full';
   const startedAt = new Date();
   const scanRunId = await openScanRun(startedAt);
@@ -362,7 +371,26 @@ export async function ingestMCPRegistry(
       `elapsed_ms=${Date.now() - startedAt.getTime()} ` +
       `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`,
     );
-    return { fetched: 0, filtered: 0, pages: progress.pages, upserted: 0, snapshots: 0, mode, updated_since: updatedSince, errors: 1, first_error: msg, elapsed_ms: Date.now() - startedAt.getTime() };
+    const ingestElapsedMs = Date.now() - startedAt.getTime();
+    return {
+      fetched: 0, filtered: 0, pages: progress.pages, upserted: 0, snapshots: 0,
+      mode, updated_since: updatedSince,
+      ingest_elapsed_ms: ingestElapsedMs,
+      total_elapsed_ms: ingestElapsedMs,
+      ...buildRegistryOutcome({
+        ingestErrors: 1,
+        ingestFirstError: msg,
+        dashboard: {
+          status: 'SKIPPED', error: null, errorClass: null,
+          durationMs: 0, startedAt: null, finishedAt: null,
+        },
+        reachability: {
+          status: 'SKIPPED', error: null, errorClass: null,
+          durationMs: 0, startedAt: null, finishedAt: null,
+        },
+        cacheHealthAfter: null,
+      }),
+    };
   }
 
   // ── 2. Filter: one entry per server name, strictly isLatest === true ────────
@@ -527,22 +555,13 @@ export async function ingestMCPRegistry(
     console.log(`[ingest-mcp-registry] chunk done — upserted=${upsertedRows.length} snapshots=${snapshotRows.length}`);
   }
 
-  const elapsed_ms = Date.now() - startedAt.getTime();
+  const ingestElapsedMs = Date.now() - startedAt.getTime();
 
   await closeScanRun(scanRunId, {
     pages_fetched:    progress.pages,
     servers_returned: allItems.length,
     status:           (errors > 0 ? 'error' : 'success') +
                       (progress.retries > 0 ? ` (recovered after ${progress.retries} rate-limit ${progress.retries === 1 ? 'retry' : 'retries'})` : ''),
-  });
-
-  await logIngestionPg({
-    sourceSlug:   SOURCE_SLUG,
-    startedAt,
-    itemsFetched: allItems.length,
-    itemsNew:     upserted,
-    metadata:     { mode, updated_since: updatedSince, filtered: latest.length, pages: progress.pages, snapshots, errors, first_error, elapsed_ms },
-    ...(first_error ? { errorMessage: first_error } : {}),
   });
 
   // ── 5. Dashboard cache refresh — POST-INGEST TRIGGER (restored 2026-08-10) ──
@@ -558,35 +577,129 @@ export async function ingestMCPRegistry(
   // recompute. It still cannot write mcp_dashboard_cache, so the 2026-08-01
   // boundary holds — what changed is WHO MAY ASK, not who may write.
   //
-  // ORDERING IS DELIBERATE: this runs AFTER logIngestionPg above, so that row
-  // records the DATA ingest's outcome only. A cache-refresh failure must not
-  // mark the ingest unsuccessful — lib/mcp/pipelineStreak.ts reads that row for
-  // pipeline liveness, and the data did land.
-  //
-  // A failed refresh DOES redden the run (errors++ → exit 1) rather than
-  // logging quietly: a green run over a stale surface is the exact hollow
-  // success this change exists to remove. The 12:00 UTC fallback repairs the
-  // cache in the meantime.
-  if (errors === 0) {
+  // The ingestion row is written after both independent attempts. Cache
+  // failures never increment ingest_errors or rerun ingestion; any partial
+  // cache outcome remains explicit and red. Missing health fails closed.
+  let cacheHealthAfter: CacheRefreshHealth | null = null;
+
+  type CacheAttempt = {
+    status: CacheRefreshStatus;
+    error: string | null;
+    errorClass: CacheRefreshErrorClass;
+    durationMs: number;
+    startedAt: string | null;
+    finishedAt: string | null;
+  };
+
+  const skippedAttempt = (): CacheAttempt => ({
+    status: 'SKIPPED', error: null, errorClass: null,
+    durationMs: 0, startedAt: null, finishedAt: null,
+  });
+  let dashboardAttempt = skippedAttempt();
+  let reachabilityAttempt = skippedAttempt();
+
+  async function readCacheHealth(): Promise<CacheRefreshHealth | null> {
     try {
-      const refreshed = await q<{ computed_at: string | null }>(
-        'SELECT public.trigger_mcp_dashboard_refresh() AS computed_at',
+      const rows = await q<{ health: CacheRefreshHealth | null }>(
+        'SELECT public.mcp_dashboard_refresh_health() AS health',
       );
-      console.log(`[ingest-mcp-registry] dashboard cache refreshed at ${refreshed[0]?.computed_at ?? 'unknown'}`);
-    } catch (err) {
-      errors++;
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[ingest-mcp-registry] dashboard cache refresh FAILED: ${msg} — the INGEST ITSELF SUCCEEDED ` +
-        `(ingestion_log already written); only the /mcp-trust cache is stale, and the 12:00 UTC pg_cron fallback will repair it`,
-      );
+      return rows[0]?.health ?? null;
+    } catch (error) {
+      console.error('[ingest-mcp-registry] cache health read unavailable:', error instanceof Error ? error.message : error);
+      return null;
     }
-  } else {
-    console.log(`[ingest-mcp-registry] dashboard cache refresh skipped — run had errors=${errors}, refusing to cache a bad ingest`);
   }
 
-  console.log(`[ingest-mcp-registry] Done — mode=${mode} fetched=${allItems.length} pages=${progress.pages} filtered=${latest.length} upserted=${upserted} snapshots=${snapshots} errors=${errors} elapsed=${elapsed_ms}ms fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`);
-  return { fetched: allItems.length, filtered: latest.length, pages: progress.pages, upserted, snapshots, mode, updated_since: updatedSince, errors, first_error, elapsed_ms };
+  async function runCacheRefresh(
+    component: 'dashboard' | 'reachability',
+    sql: string,
+  ): Promise<CacheAttempt> {
+    const attempt = skippedAttempt();
+    const startedMs = Date.now();
+    attempt.startedAt = new Date(startedMs).toISOString();
+    try {
+      const refreshed = await q<{ computed_at: string | null }>(sql);
+      attempt.status = 'SUCCEEDED';
+      console.log(`[ingest-mcp-registry] ${component} cache refreshed at ${refreshed[0]?.computed_at ?? 'unknown'}`);
+    } catch (error) {
+      attempt.status = 'FAILED';
+      attempt.error = error instanceof Error ? error.message : String(error);
+      attempt.errorClass = classifyCacheRefreshError(error);
+      console.error(
+        `[ingest-mcp-registry] ${component} cache refresh FAILED class=${attempt.errorClass}: ${attempt.error} — ` +
+        'registry ingestion remains committed; the other cache is evaluated independently',
+      );
+    } finally {
+      attempt.durationMs = Date.now() - startedMs;
+      attempt.finishedAt = new Date().toISOString();
+    }
+
+    if (attempt.status === 'FAILED') {
+      try {
+        await q(
+          'SELECT public.record_mcp_cache_refresh_failure($1,$2,$3,$4,$5,$6)',
+          [component, attempt.startedAt, attempt.finishedAt, attempt.durationMs,
+            attempt.error, attempt.errorClass],
+        );
+      } catch (recordError) {
+        const detail = recordError instanceof Error ? recordError.message : String(recordError);
+        attempt.error = `${attempt.error ?? 'CACHE_REFRESH_FAILED_WITHOUT_RECORDED_DETAIL'}; failure status unavailable: ${detail}`;
+        console.error(`[ingest-mcp-registry] ${component} failure status record unavailable: ${detail}`);
+      }
+    }
+
+    return attempt;
+  }
+
+  if (errors === 0) {
+    dashboardAttempt = await runCacheRefresh(
+      'dashboard', 'SELECT public.trigger_mcp_dashboard_refresh() AS computed_at',
+    );
+    reachabilityAttempt = await runCacheRefresh(
+      'reachability', 'SELECT public.trigger_mcp_reachability_refresh() AS computed_at',
+    );
+    cacheHealthAfter = await readCacheHealth();
+  } else {
+    console.log(`[ingest-mcp-registry] cache refreshes skipped — run had errors=${errors}, refusing to cache a bad ingest`);
+  }
+
+  const outcome = buildRegistryOutcome({
+    ingestErrors: errors,
+    ingestFirstError: first_error,
+    dashboard: dashboardAttempt,
+    reachability: reachabilityAttempt,
+    cacheHealthAfter,
+  });
+  const totalElapsedMs = Date.now() - startedAt.getTime();
+
+  await logIngestionPg({
+    sourceSlug: SOURCE_SLUG,
+    startedAt,
+    itemsFetched: allItems.length,
+    itemsNew: upserted,
+    metadata: {
+      mode, updated_since: updatedSince, filtered: latest.length, pages: progress.pages, snapshots,
+      ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
+      ...outcome,
+    },
+    ...(outcome.ingest_first_error ? { errorMessage: outcome.ingest_first_error } : {}),
+  });
+
+  console.log(
+    `[ingest-mcp-registry] Done — mode=${mode} fetched=${allItems.length} pages=${progress.pages} ` +
+    `filtered=${latest.length} upserted=${upserted} snapshots=${snapshots} ` +
+    `ingest_status=${outcome.ingest_status} dashboard_refresh_status=${outcome.dashboard_refresh_status} ` +
+    `dashboard_refresh_ms=${outcome.dashboard_refresh_ms} reachability_refresh_status=${outcome.reachability_refresh_status} ` +
+    `reachability_refresh_ms=${outcome.reachability_refresh_ms} overall_status=${outcome.overall_status} ` +
+    `ingest_elapsed_ms=${ingestElapsedMs} total_elapsed_ms=${totalElapsedMs} ` +
+    `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`,
+  );
+  return {
+    fetched: allItems.length, filtered: latest.length, pages: progress.pages,
+    upserted, snapshots, mode, updated_since: updatedSince,
+    ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
+    ...outcome,
+  };
 }
 
 // ── Freshness tripwire ───────────────────────────────────────────────────────
@@ -642,7 +755,7 @@ if (require.main === module) {
       console.log('[ingest-mcp-registry] Result:', r);
       await assertSnapshotFreshness();
       await endIngestPool();
-      process.exit(r.errors > 0 ? 1 : 0);
+      process.exit(exitCodeForRegistryOutcome(r));
     })
     .catch(async e => { console.error(e); await endIngestPool(); process.exit(1); });
 }
