@@ -89,6 +89,9 @@ interface TopicRow {
   prompt_seed: string;
   /** The exact published caption. Reviewed in the queue; never composed here. */
   caption: string | null;
+  /** An already-rendered video to publish INSTEAD of generating one. Single-use:
+      cleared when the topic is marked used, so the queue loop cannot repost it. */
+  pregenerated_media_url: string | null;
 }
 
 /**
@@ -99,7 +102,8 @@ interface TopicRow {
 async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
   if (forceName) {
     const rows = await q<TopicRow>(
-      `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption
+      `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
+              pregenerated_media_url
          FROM broadcast_topic_queue WHERE topic_name = $1 LIMIT 1`,
       [forceName],
     );
@@ -114,7 +118,8 @@ async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
      public channel should be a decision. */
   const pick = async () =>
     (await q<TopicRow>(
-      `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption
+      `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
+              pregenerated_media_url
          FROM broadcast_topic_queue
         WHERE status = 'pending'
         ORDER BY queue_position
@@ -260,10 +265,21 @@ async function main(): Promise<void> {
   if (!topic) throw new Error(forced ? `forced topic not found: ${forced}` : 'no topic available');
   console.log(`[broadcast-daily] topic=${topic.topic_name} layer=${topic.layer} evidence=${topic.evidence_status}${forced ? ' (forced)' : ''}`);
 
-  const creationId = await startGeneration(topic.prompt_seed);
-  console.log(`[broadcast-daily] generation started — creation ${creationId}`);
-  const mediaUrl = await awaitRender(creationId);
-  console.log('[broadcast-daily] render complete');
+  /* A topic can carry an already-rendered video, in which case generation is
+     skipped entirely. That is how a render produced during review gets
+     published instead of paying for a second one. The URL is consumed once --
+     cleared in the same statement that marks the topic used -- because the
+     rotation loops and a leftover URL would republish the same video forever. */
+  let mediaUrl: string;
+  if (topic.pregenerated_media_url?.trim()) {
+    mediaUrl = topic.pregenerated_media_url.trim();
+    console.log('[broadcast-daily] using pre-rendered video for this topic — generation skipped');
+  } else {
+    const creationId = await startGeneration(topic.prompt_seed);
+    console.log(`[broadcast-daily] generation started — creation ${creationId}`);
+    mediaUrl = await awaitRender(creationId);
+    console.log('[broadcast-daily] render complete');
+  }
 
   const caption = buildCaption(topic);
   const staged = await appPost('/api/broadcast/jobs', {
@@ -295,8 +311,13 @@ async function main(): Promise<void> {
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
 
+  // Clearing pregenerated_media_url here, in the same statement, is what makes
+  // it single-use. Doing it separately would leave a window where a crash
+  // between the two writes republishes the same video on the next loop.
   await q(
-    `UPDATE broadcast_topic_queue SET status = 'used', used_at = now() WHERE id = $1`,
+    `UPDATE broadcast_topic_queue
+        SET status = 'used', used_at = now(), pregenerated_media_url = NULL
+      WHERE id = $1`,
     [topic.id],
   );
   console.log(`[broadcast-daily] DONE topic=${topic.topic_name} job=${jobId} elapsed_s=${((Date.now() - startedAt) / 1000).toFixed(0)}`);
