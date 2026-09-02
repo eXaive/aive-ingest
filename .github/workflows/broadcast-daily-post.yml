@@ -1,0 +1,96 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Broadcast Daily Post — one generated explainer video per day to the
+# mister.mcp.a2a TikTok account.
+#
+# SEPARATE FROM THE INGEST WORKFLOWS ON PURPOSE. It shares the runner pattern
+# and the scoped database role, but it publishes to a social account — a very
+# different blast radius from a read-and-upsert scan. Keeping it in its own
+# file means its schedule, timeout, concurrency and failure mode can move
+# without touching a data pipeline.
+#
+# CADENCE: 14:00 UTC, deliberately offset from the 05:00 UTC registry ingest
+# and the 07:00/08:00 UTC probe and tools collectors. They share a database
+# role with a CONNECTION LIMIT, and a mid-afternoon slot also lands in a
+# reasonable posting window rather than overnight.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints status
+# codes and named fields only — never a response body, never a job row.
+# GitHub masks ${{ secrets.X }} but cannot mask a secret that arrives inside a
+# payload the script then echoes.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
+# workflow holds a database credential, a publishing API key and the app's
+# owner secret, and must not be reachable from forks.
+#
+# Required repo secrets:
+#   AIVE_INGEST_DATABASE_URL  scoped aive_ingest role (SELECT/UPDATE on
+#                             broadcast_topic_queue, SELECT on the job tables)
+#   BLOTATO_API_KEY           video generation
+#   AIVE_CRON_SECRET          Bearer for the app's requireOwnerAuth
+#   AIVE_BASE_URL             deployed app origin, e.g. https://aive.global
+#                             (a SECRET, not a variable -- checked 2026-09-02;
+#                             reading it as ${{ vars.* }} yields an empty string
+#                             and the worker fails on requireEnv)
+#
+# NOTE: the deployed app must have DISTRIBUTION_MODE=live for anything to
+# actually reach TikTok. With it unset the app's StubAdapter accepts the job
+# and returns status=pending_api. The worker treats anything other than
+# 'posted' as a failure, so that case exits NON-ZERO and the topic stays
+# pending — a stub deployment shows up as a RED run, not a green one that
+# quietly published nothing. Verified against the deployed app 2026-09-02,
+# which was in stub mode at the time of writing.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Broadcast Daily Post
+
+on:
+  schedule:
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_today:
+        description: 'Skip this run without consuming a topic (1 = skip)'
+        required: false
+        default: ''
+      force_topic:
+        description: 'Exact topic_name to use instead of the queue order (e.g. MCP)'
+        required: false
+        default: ''
+
+concurrency:
+  # Never two of these at once. The worker also checks the database for a post
+  # already made today, so a double-fire is caught even across separate runs;
+  # this is the cheaper first line of defence.
+  group: broadcast-daily-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    # Generation ran to several minutes in manual testing and the worker polls
+    # up to 40 x 15s = 10 minutes before giving up. 30 leaves room for the
+    # render plus the staging and dispatch calls without ever cutting a
+    # half-finished publish in two.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate and post
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          BLOTATO_API_KEY: ${{ secrets.BLOTATO_API_KEY }}
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          BROADCAST_SKIP_TODAY: ${{ inputs.skip_today }}
+          BROADCAST_FORCE_TOPIC: ${{ inputs.force_topic }}
+        run: npx tsx workers/broadcast-daily-post.ts
