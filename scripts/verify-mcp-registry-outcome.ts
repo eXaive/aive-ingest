@@ -43,24 +43,66 @@ const complete = buildRegistryOutcome(base);
 assert.equal(complete.overall_status, 'COMPLETE');
 assert.equal(exitCodeForRegistryOutcome(complete), 0);
 
+/* EXIT-CODE CONTRACT CHANGED 2026-09-02. These four cases previously asserted
+   exit 1. They now assert 0, and that is the point of the change rather than a
+   test bent to fit it: in every one of them the REGISTRY DATA LANDED and only a
+   derived cache is stale. Exiting 1 made four consecutive cache-only failures
+   look like four failed ingests, which is how a red run stops meaning anything.
+   The status string still records exactly what went wrong, the run still prints
+   a ::warning::, and repeated cache failure now alarms through
+   workers/ingest-watchdog.ts. Do not restore these to 1 without also removing
+   the watchdog -- the two were changed as one trade. */
 const reachabilityFailed = buildRegistryOutcome({ ...base, reachability: failure, cacheHealthAfter: health(true, false) });
 assert.equal(reachabilityFailed.overall_status, 'INGEST_SUCCEEDED_DASHBOARD_FRESH_REACHABILITY_STALE');
 assert.equal(reachabilityFailed.reachability_refresh_errors, 1);
 assert.ok(reachabilityFailed.reachability_refresh_error);
-assert.equal(exitCodeForRegistryOutcome(reachabilityFailed), 1);
+assert.equal(exitCodeForRegistryOutcome(reachabilityFailed), 0);
 
 const dashboardFailed = buildRegistryOutcome({ ...base, dashboard: failure, cacheHealthAfter: health(false, true) });
 assert.equal(dashboardFailed.overall_status, 'INGEST_SUCCEEDED_DASHBOARD_STALE_REACHABILITY_FRESH');
-assert.equal(exitCodeForRegistryOutcome(dashboardFailed), 1);
+assert.equal(exitCodeForRegistryOutcome(dashboardFailed), 0);
 
 const bothFailed = buildRegistryOutcome({ ...base, dashboard: failure, reachability: failure,
   cacheHealthAfter: health(false, false) });
 assert.equal(bothFailed.overall_status, 'INGEST_SUCCEEDED_BOTH_CACHES_STALE');
-assert.equal(exitCodeForRegistryOutcome(bothFailed), 1);
+assert.equal(exitCodeForRegistryOutcome(bothFailed), 0);
 
 const missingHealth = buildRegistryOutcome({ ...base, cacheHealthAfter: null });
 assert.equal(missingHealth.overall_status, 'INGEST_SUCCEEDED_BOTH_CACHES_STALE');
-assert.equal(exitCodeForRegistryOutcome(missingHealth), 1);
+assert.equal(exitCodeForRegistryOutcome(missingHealth), 0);
+
+/* NOT EVALUATED IS NOT FALSE. A skipped refresh, or one whose health could not
+   be read, reports null. Only a completed evaluation may say false. `?? false`
+   used to publish four confident negatives derived from one absent read. */
+assert.equal(missingHealth.cache_fallback_available, null);
+assert.equal(missingHealth.cache_fallback_active, null);
+assert.equal(missingHealth.cache_fallback_recent_healthy, null);
+assert.equal(missingHealth.cache_fallback_alert_enforced, null);
+assert.equal(missingHealth.dashboard_cache_fresh, null, 'attempted but unverifiable is UNKNOWN, not stale');
+
+const skippedCaches = buildRegistryOutcome({
+  ...base,
+  dashboard: { ...success, status: 'SKIPPED', durationMs: 0, startedAt: null, finishedAt: null },
+  reachability: { ...success, status: 'SKIPPED', durationMs: 0, startedAt: null, finishedAt: null },
+  cacheHealthAfter: null,
+});
+assert.equal(skippedCaches.dashboard_cache_fresh, null, 'a refresh never attempted cannot report false');
+assert.equal(skippedCaches.reachability_cache_fresh, null);
+
+// A refresh that ran and demonstrably did not land is a real false, not UNKNOWN,
+// and a health read that DID happen still reports its own booleans.
+assert.equal(bothFailed.dashboard_cache_fresh, false);
+assert.equal(bothFailed.cache_fallback_available, true);
+
+/* PARTIAL: pagination stopped early but servers were committed. Distinct from
+   both neighbours and distinct in the exit code, so a slice is never reported
+   as a completed census. */
+const partial = buildRegistryOutcome({ ...base, ingestPartial: true, ingestFirstError: 'partial scan: Registry 500' });
+assert.equal(partial.ingest_status, 'PARTIAL');
+assert.equal(partial.overall_status, 'INGEST_PARTIAL');
+assert.equal(partial.ingest_errors, 0, 'a partial scan is not an errored scan');
+assert.equal(partial.ingest_first_error, 'partial scan: Registry 500', 'a partial run keeps the reason it stopped');
+assert.equal(exitCodeForRegistryOutcome(partial), 2);
 
 const ingestFailed = buildRegistryOutcome({ ...base, ingestErrors: 1, ingestFirstError: null,
   dashboard: { ...success, status: 'SKIPPED', durationMs: 0, startedAt: null, finishedAt: null },

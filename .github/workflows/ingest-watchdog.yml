@@ -1,0 +1,90 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Ingest Watchdog — alerts on the DATA going quiet, not on a worker failing.
+#
+# WHY IT IS A SEPARATE WORKFLOW. Every other alert here is "a worker noticed
+# something and exited non-zero", which cannot fire when the worker does not
+# run. A disabled workflow, a cron that stops dispatching, a runner that never
+# starts: none of those produce a red run, and a silent ingest looks exactly
+# like a healthy quiet day. This job shares no code path and no schedule with
+# the ingest workers on purpose — a watchdog that fails whenever the thing it
+# watches fails is just a second copy of the problem.
+#
+# IT ALSO HOLDS UP THE EXIT-CODE CHANGE. As of 2026-09-02 a cache-refresh
+# failure no longer paints the daily registry run red (exitCodeForRegistryOutcome
+# returns 0 when the DATA landed). That is only defensible because repeated
+# cache failure and cache staleness are caught here. Disabling this workflow
+# silently un-does that decision and leaves cache failures with no alarm.
+#
+# CADENCE: 12:00 UTC. Deliberately NOT adjacent to any ingest slot (03:00
+# through 08:00, plus broadcast at 14:00). It must observe a settled day, not
+# race the run it is judging. The 24h gap threshold is measured against the
+# registry's 05:00 cron, and GitHub's scheduled dispatch drifts by hours on
+# this repo — a midday check gives even a badly delayed morning run time to
+# land before its absence is called an outage.
+#
+# WHY NOT MORE OFTEN: nothing it watches moves faster than daily, and a
+# watchdog that pages on a schedule finer than its subject only manufactures
+# noise. The one exception is the reachability cache's 6h SLA, which a daily
+# check can miss by several hours; that is a known and accepted lag, recorded
+# here rather than solved by polling.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this holds
+# a database credential and must not be reachable from forks.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints source
+# slugs, counts and ages — never a row body, never a connection string.
+#
+# Required repo secret:
+#   AIVE_INGEST_DATABASE_URL   scoped aive_ingest role. Needs SELECT on
+#                              ingestion_log (granted in aive-platform
+#                              migration 20260902000009) and EXECUTE on
+#                              mcp_dashboard_refresh_health(). No writes: the
+#                              watchdog must not be able to log its own
+#                              all-clear.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Ingest Watchdog
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      gap_hours:
+        description: 'Hours without an ingestion before alerting (default 24)'
+        required: false
+        default: ''
+      consecutive_failures:
+        description: 'Consecutive failed runs before alerting (default 3)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ingest-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    # Four bounded queries. If this is still running at 10 minutes the database
+    # is the problem, which is itself worth a red run.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check ingest health
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          WATCHDOG_GAP_HOURS: ${{ inputs.gap_hours }}
+          WATCHDOG_CONSECUTIVE_FAILURES: ${{ inputs.consecutive_failures }}
+        run: npx tsx workers/ingest-watchdog.ts

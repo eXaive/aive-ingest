@@ -58,13 +58,16 @@ const SOURCE_SLUG   = 'mcp-registry';
 
 // Cumulative time attribution + page counts, shared across the fetch helpers
 // as out-params so a mid-pagination throw still leaves counts readable.
-interface ScanProgress {
+export interface ScanProgress {
   pages:          number; // completed pages
   pagesAttempted: number; // requests issued (completed + the page in flight/failed)
-  retries:        number; // 429 retries
+  retries:        number; // total retries (429 + 5xx)
+  retries429:     number; // rate-limit retries
+  retries5xx:     number; // upstream-error retries
   fetchMs:        number; // cumulative ms inside fetch() calls
   sleepMs:        number; // cumulative ms in inter-page pacing sleep
-  backoffMs:      number; // cumulative ms in 429 backoff sleep
+  backoffMs:      number; // cumulative ms in retry backoff sleep
+  lastCursor:     string | null; // cursor for the page that failed — the resume point
 }
 
 // (supabase-js client removed — all DB access goes through lib/ingest/db.ts)
@@ -164,8 +167,32 @@ function semverGt(a: string | null | undefined, b: string | null | undefined): b
 //      with observed ~80ms/page) to avoid tripping the limit at all. At the
 //      observed 647-page full scan this adds ~162s: roughly 1 min → ~4 min.
 
+// ── 5xx retry (added 2026-09-02 after the 09-02 scheduled run) ─────────────
+// That run walked 45 of ~890 pages and then took a single HTTP 500 from the
+// registry ("Failed to get registry list"). The ladder above only recognised
+// 429, so `res.status !== 429` returned the 500 straight to the caller, the
+// !ok check threw, and 4,500 already-fetched servers were discarded. The
+// registry answered 200 on five consecutive probes hours later: it was a
+// transient upstream blip, and one retry would have absorbed it.
+//
+// 5xx and 429 share the retry ladder because they call for the same response
+// -- wait, ask again for the SAME page. They are counted separately so the
+// scan_runs status can say which one happened; "recovered after 2 retries" is
+// a different operational story depending on whether the registry was rate
+// limiting us or falling over.
+//
+// 4xx OTHER THAN 429 IS NOT RETRIED, deliberately. A 400 or 404 is a bad
+// request -- a malformed cursor, a dropped parameter -- and asking again with
+// the identical URL cannot fix it. Retrying those would turn a fast, loud,
+// correct failure into three slow ones.
+
 const INTER_PAGE_DELAY_MS = 250;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000]; // max 3 retry attempts
+
+/** Worth asking again for the same page: rate limiting, or the far side faltering. */
+export function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -181,12 +208,12 @@ function retryAfterMs(res: Response): number | null {
 }
 
 /**
- * Fetch one page. On 429: back off and retry the SAME page (never the next
- * one) up to RETRY_BACKOFF_MS.length times, preferring Retry-After when the
- * registry sends it. Returns the final Response — a still-429 response after
- * exhaustion is returned to the caller, whose !ok throw ends the run.
+ * Fetch one page. On 429 or 5xx: back off and retry the SAME page (never the
+ * next one) up to RETRY_BACKOFF_MS.length times, preferring Retry-After when
+ * the registry sends it. Returns the final Response — a still-failing response
+ * after exhaustion is returned to the caller, whose !ok check ends pagination.
  */
-async function fetchPageWithRetry(url: string, progress: ScanProgress): Promise<Response> {
+export async function fetchPageWithRetry(url: string, progress: ScanProgress): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
     const tFetch = Date.now();
     const res = await fetch(url, {
@@ -194,13 +221,14 @@ async function fetchPageWithRetry(url: string, progress: ScanProgress): Promise<
       signal: AbortSignal.timeout(30_000),
     });
     progress.fetchMs += Date.now() - tFetch;
-    if (res.status !== 429) return res;
-    if (attempt >= RETRY_BACKOFF_MS.length) return res; // exhausted → caller throws
+    if (!isRetryableStatus(res.status)) return res;
+    if (attempt >= RETRY_BACKOFF_MS.length) return res; // exhausted → caller halts
     const hinted = retryAfterMs(res);
     const waitMs = hinted ?? RETRY_BACKOFF_MS[attempt];
     progress.retries++;
+    if (res.status === 429) progress.retries429++; else progress.retries5xx++;
     console.log(
-      `[ingest-mcp-registry] 429 page=${progress.pagesAttempted} attempt=${attempt + 1}/${RETRY_BACKOFF_MS.length} backoff_ms=${waitMs} ` +
+      `[ingest-mcp-registry] ${res.status} page=${progress.pagesAttempted} attempt=${attempt + 1}/${RETRY_BACKOFF_MS.length} backoff_ms=${waitMs} ` +
       `(${hinted !== null ? 'Retry-After honoured' : 'backoff schedule'}) — halting pagination; retrying this page`,
     );
     await res.text().catch(() => ''); // drain before waiting
@@ -217,27 +245,59 @@ async function fetchPageWithRetry(url: string, progress: ScanProgress): Promise<
 //     hides them), so deletion transitions become observable.
 //   updatedSince — when set (delta mode), only servers changed since that
 //     timestamp are returned; null (full mode) sweeps everything.
-async function fetchAllItems(
+/**
+ * Result of a sweep. `complete` false means pagination stopped early and
+ * `items` holds everything fetched up to that point — NOT an empty result.
+ * The caller decides what to do with a partial corpus; it is never discarded
+ * here.
+ */
+export interface FetchOutcome {
+  items: MCPRegistryItem[];
+  complete: boolean;
+  failure: string | null;
+  /** Cursor of the page that failed; feed back via MCP_RESUME_CURSOR to continue. */
+  resumeCursor: string | null;
+}
+
+export async function fetchAllItems(
   progress: ScanProgress,
   updatedSince: string | null,
-): Promise<MCPRegistryItem[]> {
+  startCursor: string | null,
+  /* Overridable so scripts/verify-registry-retry.ts can point the real
+     pagination loop at a loopback server and prove the retry and partial-scan
+     behaviour end to end. A parameter rather than an env var deliberately:
+     an env hook would be a live production switch that exists only for tests,
+     and pointing the daily ingest at an arbitrary host is not a capability
+     worth shipping to save a line here. */
+  baseUrl: string = REGISTRY_BASE,
+): Promise<FetchOutcome> {
   const all: MCPRegistryItem[] = [];
-  let cursor: string | null = null;
+  let cursor: string | null = startCursor;
   const t0 = Date.now();
 
   do {
-    const url = new URL(`${REGISTRY_BASE}/servers`);
+    const url = new URL(`${baseUrl}/servers`);
     url.searchParams.set('limit', String(PAGE_LIMIT));
     url.searchParams.set('include_deleted', 'true');
     if (updatedSince) url.searchParams.set('updated_since', updatedSince);
     if (cursor)       url.searchParams.set('cursor', cursor);
 
     progress.pagesAttempted++;
+    progress.lastCursor = cursor;
     const res = await fetchPageWithRetry(url.toString(), progress);
 
-    // A 429 here means retries are exhausted: pagination has already halted
-    // (no subsequent page was requested) and this throw ends the run red.
-    if (!res.ok) throw new Error(`Registry ${res.status}: ${await res.text().catch(() => '')}`);
+    /* Retries are exhausted. Pagination halts here — but everything already
+       fetched is HANDED BACK, not thrown away. Before 2026-09-02 this threw,
+       and the catch turned 45 pages of real data into `fetched: 0`. */
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      return {
+        items: all,
+        complete: false,
+        failure: `Registry ${res.status}: ${body}`,
+        resumeCursor: cursor,
+      };
+    }
 
     const page: RegistryPage = await res.json();
     progress.pages++;
@@ -260,7 +320,7 @@ async function fetchAllItems(
     }
   } while (cursor);
 
-  return all;
+  return { items: all, complete: true, failure: null, resumeCursor: null };
 }
 
 /** Delta anchor: the newest snapshot captured_at from the last successful run.
@@ -318,13 +378,29 @@ export async function ingestMCPRegistry(
   fetched: number; filtered: number; pages: number; upserted: number; snapshots: number;
   mode: 'full' | 'delta'; updated_since: string | null;
   ingest_elapsed_ms: number; total_elapsed_ms: number;
+  /** Where a partial sweep stopped; null when the sweep completed. */
+  resume_cursor: string | null;
 } & RegistryOutcome> {
   const mode = opts.mode ?? 'full';
   const startedAt = new Date();
   const scanRunId = await openScanRun(startedAt);
-  const progress: ScanProgress = { pages: 0, pagesAttempted: 0, retries: 0, fetchMs: 0, sleepMs: 0, backoffMs: 0 };
+  const progress: ScanProgress = {
+    pages: 0, pagesAttempted: 0, retries: 0, retries429: 0, retries5xx: 0,
+    fetchMs: 0, sleepMs: 0, backoffMs: 0, lastCursor: null,
+  };
   let upserted = 0, snapshots = 0, errors = 0;
+  let partialVersionSkips = 0; // rows held back by the partial-scan version guard
   let first_error: string | null = null;
+
+  /* Manual continuation of a partial sweep: set MCP_RESUME_CURSOR to the
+     resume_cursor a partial run reported. Deliberately NOT automatic — a
+     resumed run covers only the tail of the corpus, so refreshing last_seen
+     for that slice alone is a decision an operator makes knowingly, not a
+     default that quietly replaces the daily census. */
+  const resumeCursor = process.env.MCP_RESUME_CURSOR?.trim() || null;
+  if (resumeCursor) {
+    console.log(`[ingest-mcp-registry] resuming from cursor=${resumeCursor} — this sweep covers only the remainder of the corpus`);
+  }
 
   // Delta mode polls only servers changed since the last successful snapshot;
   // full mode (default; the workflow entrypoint) sweeps everything so last_seen
@@ -349,21 +425,39 @@ export async function ingestMCPRegistry(
   }
 
   // ── 1. Fetch ────────────────────────────────────────────────────────────────
-  let allItems: MCPRegistryItem[];
+  let fetchOutcome: FetchOutcome;
   try {
-    allItems = await fetchAllItems(progress, updatedSince);
-    console.log(`[ingest-mcp-registry] Fetched ${allItems.length} items across ${progress.pages} pages (mode=${mode}${updatedSince ? ` since=${updatedSince}` : ''}, include_deleted)`);
+    fetchOutcome = await fetchAllItems(progress, updatedSince, resumeCursor);
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error('[ingest-mcp-registry] Fetch failed:', msg);
-    // Distinguish a partial scan from a total failure: pages_completed is how
-    // far pagination got before the failure; pages_attempted includes the page
-    // that failed. A rate-limit exhaustion is named as such.
+    /* A THROW here is not an HTTP failure — those come back as
+       complete:false with the pages already fetched. This is a network-layer
+       fault (DNS, socket reset, the 30s AbortSignal) or a malformed body, and
+       it loses the in-flight page's accumulator, so it stays a total failure.
+       Closing that gap means moving accumulation out of fetchAllItems; the
+       HTTP path is what actually broke on 09-02 and is what this pass fixes. */
+    fetchOutcome = {
+      items: [], complete: false,
+      failure: err instanceof Error ? err.message : String(err),
+      resumeCursor: progress.lastCursor,
+    };
+  }
+
+  const allItems = fetchOutcome.items;
+  /* PARTIAL: pagination stopped early but there is real data to commit.
+     TOTAL FAILURE: it stopped early with nothing. Only the second discards. */
+  const partial = !fetchOutcome.complete && allItems.length > 0;
+
+  if (!fetchOutcome.complete) {
+    console.error('[ingest-mcp-registry] Fetch failed:', fetchOutcome.failure);
+  }
+
+  if (!fetchOutcome.complete && allItems.length === 0) {
+    const msg = fetchOutcome.failure ?? 'fetch failed without recorded detail';
     const kind = msg.startsWith('Registry 429') ? 'error rate_limited (retries exhausted)' : 'error';
     const scanStatus =
       `${kind} pages_completed=${progress.pages} pages_attempted=${progress.pagesAttempted}` +
-      (progress.retries > 0 ? ` retries=${progress.retries}` : '') +
-      (progress.pages > 0 ? ' — partial scan' : ' — total failure');
+      (progress.retries > 0 ? ` retries=${progress.retries} (429=${progress.retries429} 5xx=${progress.retries5xx})` : '') +
+      ' — total failure';
     await closeScanRun(scanRunId, { pages_fetched: progress.pages, servers_returned: null, status: scanStatus });
     await logIngestionPg({ sourceSlug: SOURCE_SLUG, startedAt, errorMessage: msg });
     console.log(
@@ -377,6 +471,7 @@ export async function ingestMCPRegistry(
       mode, updated_since: updatedSince,
       ingest_elapsed_ms: ingestElapsedMs,
       total_elapsed_ms: ingestElapsedMs,
+      resume_cursor: fetchOutcome.resumeCursor,
       ...buildRegistryOutcome({
         ingestErrors: 1,
         ingestFirstError: msg,
@@ -392,6 +487,15 @@ export async function ingestMCPRegistry(
       }),
     };
   }
+
+  if (partial) {
+    console.warn(
+      `[ingest-mcp-registry] PARTIAL SCAN — keeping ${allItems.length} servers from ${progress.pages} completed page(s) ` +
+      `instead of discarding them; resume_cursor=${fetchOutcome.resumeCursor ?? '(start)'}`,
+    );
+    first_error = `partial scan: ${fetchOutcome.failure}`;
+  }
+  console.log(`[ingest-mcp-registry] Fetched ${allItems.length} items across ${progress.pages} pages (mode=${mode}${updatedSince ? ` since=${updatedSince}` : ''}, include_deleted${partial ? ', PARTIAL' : ''})`);
 
   // ── 2. Filter: one entry per server name, strictly isLatest === true ────────
   // Group all items by server name first so we can apply per-name selection.
@@ -459,10 +563,10 @@ export async function ingestMCPRegistry(
     const names = chunk.map(r => r.name);
 
     // 4a. Pre-fetch existing (name, id, all three hashes) for this chunk — 1 query
-    let existingRows: { name: string; id: string; definition_hash: string | null; status_hash: string | null; status_message_hash: string | null }[];
+    let existingRows: { name: string; id: string; version: string | null; definition_hash: string | null; status_hash: string | null; status_message_hash: string | null }[];
     try {
       existingRows = await q(
-        'SELECT name, id, definition_hash, status_hash, status_message_hash FROM mcp_servers WHERE name = ANY($1)',
+        'SELECT name, id, version, definition_hash, status_hash, status_message_hash FROM mcp_servers WHERE name = ANY($1)',
         [names],
       );
     } catch (fetchErr) {
@@ -471,12 +575,37 @@ export async function ingestMCPRegistry(
     }
 
     const existingMap = new Map(
-      existingRows.map((r) => [r.name, { id: r.id, hash: r.definition_hash, statusHash: r.status_hash, statusMsgHash: r.status_message_hash }])
+      existingRows.map((r) => [r.name, { id: r.id, version: r.version, hash: r.definition_hash, statusHash: r.status_hash, statusMsgHash: r.status_message_hash }])
     );
+
+    /* 4b-pre. PARTIAL-SCAN VERSION GUARD.
+       The isLatest filter picks the highest version PER NAME out of the corpus
+       it was given. On a complete sweep that corpus holds every version. On a
+       partial one it does not, so a name whose newest version sat on an
+       unfetched page would be "upgraded" to an older version — writing a
+       backwards definition_hash and a spurious snapshot recording a downgrade
+       that never happened.
+
+       So on a partial sweep, skip any row the database already holds at a
+       higher semver. Ordering-independent by design: it does not assume the
+       registry paginates by name, only that a version we already recorded is
+       not superseded by a lower one. A complete sweep skips this entirely —
+       there, a lower version IS the truth (a genuine registry rollback). */
+    const writable = partial
+      ? chunk.filter((row) => {
+          const existing = existingMap.get(row.name);
+          if (!existing?.version || !row.version) return true;
+          if (!semverGt(existing.version, row.version)) return true;
+          partialVersionSkips++;
+          return false;
+        })
+      : chunk;
+
+    if (writable.length === 0) continue;
 
     // 4b. Bulk upsert — 1 query; returns name+id for new and updated rows
     // Strip internal _hash/_item fields before sending to Supabase
-    const upsertPayload: ServerRow[] = chunk.map(({ _hash: _h, _item: _i, ...row }) => row);
+    const upsertPayload: ServerRow[] = writable.map(({ _hash: _h, _item: _i, ...row }) => row);
 
     let upsertedRows: { name: string; id: string }[];
     try {
@@ -510,7 +639,7 @@ export async function ingestMCPRegistry(
     // even when version/packages/remotes (definition_hash) are unchanged — the
     // gap that silently dropped deprecation/deletion transitions before.
     const snapshotRows: object[] = [];
-    for (const row of chunk) {
+    for (const row of writable) {
       const existing = existingMap.get(row.name);
       const changed =
         !existing ||
@@ -557,11 +686,21 @@ export async function ingestMCPRegistry(
 
   const ingestElapsedMs = Date.now() - startedAt.getTime();
 
+  const retryNote = progress.retries > 0
+    ? ` (recovered after ${progress.retries} ${progress.retries === 1 ? 'retry' : 'retries'}: 429=${progress.retries429} 5xx=${progress.retries5xx})`
+    : '';
   await closeScanRun(scanRunId, {
     pages_fetched:    progress.pages,
     servers_returned: allItems.length,
-    status:           (errors > 0 ? 'error' : 'success') +
-                      (progress.retries > 0 ? ` (recovered after ${progress.retries} rate-limit ${progress.retries === 1 ? 'retry' : 'retries'})` : ''),
+    /* A partial scan is named as such so downstream can tell a census from a
+       slice: last_seen is only a liveness marker for servers this run reached. */
+    status:           (errors > 0 ? 'error' : partial ? 'partial' : 'success') +
+                      retryNote +
+                      (partial
+                        ? ` — pagination stopped at page ${progress.pagesAttempted}: ${fetchOutcome.failure}` +
+                          ` resume_cursor=${fetchOutcome.resumeCursor ?? '(start)'}` +
+                          (partialVersionSkips > 0 ? ` version_guard_skipped=${partialVersionSkips}` : '')
+                        : ''),
   });
 
   // ── 5. Dashboard cache refresh — POST-INGEST TRIGGER (restored 2026-08-10) ──
@@ -651,7 +790,7 @@ export async function ingestMCPRegistry(
     return attempt;
   }
 
-  if (errors === 0) {
+  if (errors === 0 && !partial) {
     dashboardAttempt = await runCacheRefresh(
       'dashboard', 'SELECT public.trigger_mcp_dashboard_refresh() AS computed_at',
     );
@@ -659,6 +798,11 @@ export async function ingestMCPRegistry(
       'reachability', 'SELECT public.trigger_mcp_reachability_refresh() AS computed_at',
     );
     cacheHealthAfter = await readCacheHealth();
+  } else if (partial) {
+    /* The caches present themselves as a picture of the whole registry.
+       Recomputing them from a slice would publish that slice AS the census,
+       with no marker saying so. Better a cache that is visibly one day old. */
+    console.log('[ingest-mcp-registry] cache refreshes skipped — partial scan; will not publish a slice as a full census');
   } else {
     console.log(`[ingest-mcp-registry] cache refreshes skipped — run had errors=${errors}, refusing to cache a bad ingest`);
   }
@@ -669,6 +813,7 @@ export async function ingestMCPRegistry(
     dashboard: dashboardAttempt,
     reachability: reachabilityAttempt,
     cacheHealthAfter,
+    ingestPartial: partial,
   });
   const totalElapsedMs = Date.now() - startedAt.getTime();
 
@@ -680,6 +825,9 @@ export async function ingestMCPRegistry(
     metadata: {
       mode, updated_since: updatedSince, filtered: latest.length, pages: progress.pages, snapshots,
       ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
+      retries: progress.retries, retries_429: progress.retries429, retries_5xx: progress.retries5xx,
+      resume_cursor: fetchOutcome.resumeCursor,
+      partial_version_guard_skipped: partialVersionSkips,
       ...outcome,
     },
     ...(outcome.ingest_first_error ? { errorMessage: outcome.ingest_first_error } : {}),
@@ -692,41 +840,55 @@ export async function ingestMCPRegistry(
     `dashboard_refresh_ms=${outcome.dashboard_refresh_ms} reachability_refresh_status=${outcome.reachability_refresh_status} ` +
     `reachability_refresh_ms=${outcome.reachability_refresh_ms} overall_status=${outcome.overall_status} ` +
     `ingest_elapsed_ms=${ingestElapsedMs} total_elapsed_ms=${totalElapsedMs} ` +
-    `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}`,
+    `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs} ` +
+    `retries=${progress.retries} (429=${progress.retries429} 5xx=${progress.retries5xx})`,
   );
   return {
     fetched: allItems.length, filtered: latest.length, pages: progress.pages,
     upserted, snapshots, mode, updated_since: updatedSince,
     ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
+    resume_cursor: fetchOutcome.resumeCursor,
     ...outcome,
   };
 }
 
 // ── Freshness tripwire ───────────────────────────────────────────────────────
 // Same pattern as the Finance-stream tripwire in run-scheduler-tick.ts: the
-// newest mcp_server_snapshots.captured_at must be younger than 48h, else the
-// standalone runner exits non-zero and the Actions run turns RED — that red
-// run IS the alert. Snapshots are write-on-change, but the registry is large
-// enough that a daily full scan writes some snapshot every day; 48h = one
-// fully missed day + buffer. MCP_FRESHNESS_HOURS overrides for testing.
+// newest mcp_server_snapshots.captured_at must be younger than the window
+// below, else the standalone runner exits non-zero and the Actions run turns
+// RED — that red run IS the alert. Snapshots are write-on-change, but the
+// registry is large enough that a daily full scan writes some snapshot every
+// day. MCP_FRESHNESS_HOURS overrides for testing.
+//
+// 48h → 26h (2026-09-02). At 48h the gate tolerated a FULLY MISSED DAY: it
+// takes two consecutive failures to trip, so the first one is invisible.
+// Demonstrated on the 09-02 run, which ingested nothing and still printed
+// "✓ snapshot stream fresh (newest 22.4h old)". The window has to be shorter
+// than two runs for one missed run to register.
+//
+// 26h = 24h cadence + 2h of scheduler slack. That slack is not cosmetic:
+// GitHub's scheduled dispatch drifts badly on this repo — a cron of 05:00 has
+// started as late as 17:08, so consecutive runs can sit ~25h apart with
+// nothing wrong. 26h absorbs ordinary drift and still trips on a missed day;
+// a tighter window would just relabel GitHub's queueing as a data outage.
 /* Data quality, not security: a bad value here skews a freshness window, it
    does not open a gate. So this one LOGS LOUDLY and continues on the documented
    default rather than refusing — refusing would stop an ingest for a cosmetic
    misconfiguration. Number(undefined) is NaN, which every comparison treats as
    false, so the check is still necessary. */
-const MCP_FRESHNESS_PARSED = parseLimit(process.env.MCP_FRESHNESS_HOURS, 48);
+const MCP_FRESHNESS_PARSED = parseLimit(process.env.MCP_FRESHNESS_HOURS, 26);
 if (!MCP_FRESHNESS_PARSED.ok) {
   console.error(
     [
       "================================================================",
       `  MCP_FRESHNESS_HOURS is unreadable: ${MCP_FRESHNESS_PARSED.problem}`,
-      "  Falling back to 48h. Freshness reporting will not reflect the",
+      "  Falling back to 26h. Freshness reporting will not reflect the",
       "  configured value until this is corrected.",
       "================================================================",
     ].join("\n"),
   );
 }
-const MCP_FRESHNESS_HOURS = MCP_FRESHNESS_PARSED.value ?? 48;
+const MCP_FRESHNESS_HOURS = MCP_FRESHNESS_PARSED.value ?? 26;
 
 export async function assertSnapshotFreshness(): Promise<void> {
   let data: { captured_at: string }[];
@@ -749,10 +911,35 @@ export async function assertSnapshotFreshness(): Promise<void> {
 
 // ── Standalone runner (also the GHA daily-workflow entrypoint) ───────────────
 
+/* GitHub Actions annotations. A run that exits 0 because the DATA landed can
+   still have something worth seeing at the top of the run page; without this,
+   moving cache failures off the exit code would make them invisible rather
+   than proportionate. `::warning::` is a plain marker with no secret in it. */
+function annotate(outcome: RegistryOutcome, resumeCursor: string | null): void {
+  if (outcome.ingest_status === 'PARTIAL') {
+    console.log(`::warning title=MCP registry partial scan::Committed what was fetched, then stopped. Resume cursor: ${resumeCursor ?? '(start)'}`);
+  }
+  for (const [name, status, fresh] of [
+    ['dashboard', outcome.dashboard_refresh_status, outcome.dashboard_cache_fresh],
+    ['reachability', outcome.reachability_refresh_status, outcome.reachability_cache_fresh],
+  ] as const) {
+    if (status === 'FAILED') {
+      console.log(`::warning title=MCP ${name} cache refresh failed::Registry data committed; the ${name} cache is serving older figures. Repeated failures go red via ingest-watchdog.`);
+    } else if (status === 'SUCCEEDED' && fresh === false) {
+      console.log(`::warning title=MCP ${name} cache still stale::The refresh call succeeded but the cache row did not record a fresh publish.`);
+    }
+  }
+}
+
 if (require.main === module) {
   ingestMCPRegistry()
     .then(async r => {
       console.log('[ingest-mcp-registry] Result:', r);
+      annotate(r, r.resume_cursor);
+      /* Freshness runs BEFORE the exit code is chosen and throws on failure,
+         so a dark stream is exit 1 regardless of how the ingest reported
+         itself — a run that ingests nothing and calls it fine is exactly what
+         this tripwire exists to catch. */
       await assertSnapshotFreshness();
       await endIngestPool();
       process.exit(exitCodeForRegistryOutcome(r));
