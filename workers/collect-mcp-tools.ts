@@ -50,7 +50,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { q, ingestPool, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
+import { q, ingestPool, endIngestPool, logIngestionPg } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
 // Operator opt-outs, SHARED with discover-mcp-servers.ts. Not a second copy of
 // the matching rules: this worker's dispatch loop already restates runSweep's
@@ -92,6 +92,13 @@ const INSERT_CHUNK = 500;
 /** Cursor pages per endpoint. A stop is RECORDED as truncated, never swallowed. */
 const MAX_PAGES = 20;
 const MAX_BODY_BYTES = 1_048_576; // tool lists are larger than discover results
+export const TOOL_POLICY_VERSION = 'mcp-tools-list-v1';
+export const PROTOCOL_POLICY_VERSION = 'mcp-2026-07-28-anonymous-direct-list-v1';
+export const SCHEMA_HASH_VERSION = 'input-schema-canonical-sha256-v1';
+export const CONTRACT_HASH_VERSION = 'input-contract-canonical-sha256-v1';
+export const TOOL_VALIDATOR_VERSION = 'mcp-tool-capture-v1';
+export const TOOL_COLLECTION_VANTAGE_ID = 'github-actions-default';
+export const TOOL_COLLECTOR_ENVIRONMENT = 'github_actions';
 
 /** One constant feeds the header and the body, so HeaderMismatch is unrepresentable. */
 function toolsBody(cursor: string | null): string {
@@ -165,6 +172,97 @@ export interface CaptureRow {
   list_changed: boolean | null;
   note: string | null;
   tools: ToolRow[];
+}
+
+export interface ToolRunProvenance {
+  scheduledFor: string | null;
+  triggerKind: 'SCHEDULED' | 'MANUAL';
+  collectorVersion: string;
+  externalWorkflowRunId: string | null;
+  externalWorkflowRunAttempt: number | null;
+}
+
+export type ToolRunCounts = {
+  expected: number; eligible: number; attempted: number; completed: number;
+  persisted: number; notAttempted: number; failedInternal: number; excluded: number;
+};
+
+function provenanceFromEnvironment(): ToolRunProvenance {
+  const attemptRaw = process.env.AIVE_TOOL_WORKFLOW_RUN_ATTEMPT;
+  const attempt = attemptRaw && /^\d+$/.test(attemptRaw) && Number(attemptRaw) > 0 ? Number(attemptRaw) : null;
+  const scheduledRaw = process.env.AIVE_TOOL_SCHEDULED_FOR?.trim();
+  return {
+    scheduledFor: scheduledRaw && Number.isFinite(Date.parse(scheduledRaw)) ? new Date(scheduledRaw).toISOString() : null,
+    triggerKind: process.env.AIVE_TOOL_TRIGGER_KIND === 'SCHEDULED' ? 'SCHEDULED' : 'MANUAL',
+    collectorVersion: process.env.AIVE_TOOL_COLLECTOR_VERSION?.trim() || 'local-unversioned',
+    externalWorkflowRunId: process.env.AIVE_TOOL_WORKFLOW_RUN_ID?.trim() || null,
+    externalWorkflowRunAttempt: attempt,
+  };
+}
+
+export async function openToolCollectionRun(
+  query: typeof q,
+  startedAt: Date,
+  provenance: ToolRunProvenance,
+): Promise<string> {
+  const rows = await query<{ id: string }>(
+    `INSERT INTO mcp_tool_collection_runs (
+       started_at, scheduled_for, trigger_kind, state,
+       collector_version, tool_policy_version, protocol_policy_version,
+       schema_hash_version, contract_hash_version, validator_version,
+       collection_vantage_id, collector_environment,
+       external_workflow_run_id, external_workflow_run_attempt
+     ) VALUES ($1,$2,$3,'RUNNING',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+    [startedAt.toISOString(), provenance.scheduledFor, provenance.triggerKind,
+      provenance.collectorVersion, TOOL_POLICY_VERSION, PROTOCOL_POLICY_VERSION,
+      SCHEMA_HASH_VERSION, CONTRACT_HASH_VERSION, TOOL_VALIDATOR_VERSION,
+      TOOL_COLLECTION_VANTAGE_ID, TOOL_COLLECTOR_ENVIRONMENT,
+      provenance.externalWorkflowRunId, provenance.externalWorkflowRunAttempt],
+  );
+  const id = rows[0]?.id;
+  if (!id) throw new Error('mcp_tool_collection_runs insert returned no run id; refusing to collect without durable run identity');
+  return id;
+}
+
+export async function updateToolCollectionRun(
+  query: typeof q,
+  id: string,
+  state: 'RUNNING' | 'COMPLETE' | 'PARTIAL' | 'FAILED' | 'CANCELLED',
+  counts: ToolRunCounts,
+  failureCode: string | null,
+): Promise<void> {
+  await query(
+    `UPDATE mcp_tool_collection_runs SET
+       completed_at = CASE WHEN $2 = 'RUNNING' THEN NULL ELSE now() END,
+       state=$2, expected_endpoint_count=$3, eligible_endpoint_count=$4,
+       attempted_endpoint_count=$5, completed_endpoint_count=$6,
+       persisted_endpoint_count=$7, not_attempted_endpoint_count=$8,
+       failed_internal_count=$9, excluded_endpoint_count=$10, failure_code=$11
+     WHERE id=$1`,
+    [id, state, counts.expected, counts.eligible, counts.attempted, counts.completed,
+      counts.persisted, counts.notAttempted, counts.failedInternal, counts.excluded, failureCode],
+  );
+}
+
+export async function beginToolCollection<T>(
+  query: typeof q,
+  selectTargets: () => Promise<T>,
+  startedAt: Date,
+  provenance: ToolRunProvenance,
+): Promise<{ runId: string; selection: T }> {
+  const runId = await openToolCollectionRun(query, startedAt, provenance);
+  try {
+    const selection = await selectTargets();
+    return { runId, selection };
+  } catch (err) {
+    const empty: ToolRunCounts = {
+      expected: 0, eligible: 0, attempted: 0, completed: 0,
+      persisted: 0, notAttempted: 0, failedInternal: 0, excluded: 0,
+    };
+    try { await updateToolCollectionRun(query, runId, 'FAILED', empty, 'TARGET_SELECTION_FAILED'); }
+    catch { /* preserve the original selection failure */ }
+    throw err;
+  }
 }
 
 /** Bounded body read. Guarded at every call site -- see the note there. */
@@ -496,6 +594,85 @@ export async function loadTargets(): Promise<{ targets: Target[]; excluded: Reco
   return { targets, excluded };
 }
 
+const TOOL_COLS = [
+  'capture_id', 'server_id', 'endpoint_url', 'tool_name', 'tool_title',
+  'description', 'input_schema', 'output_schema', 'schema_hash',
+  'contract_hash', 'param_set', 'param_count', 'required_count', 'max_depth',
+  'type_union', 'union_via_composition', 'has_ref', 'has_defs',
+  'annotations', 'token_estimate',
+];
+
+type TransactionClient = {
+  query: (text: string, values?: unknown[]) => Promise<{ rows: any[] }>;
+  release: () => void;
+};
+
+/**
+ * Persist one endpoint capture and all of its tool observations atomically.
+ * A failure at any point rolls the capture back, so an apparently complete
+ * capture can never survive without every observed tool row.
+ */
+export async function persistCaptureAtomically(
+  c: CaptureRow,
+  toolCollectionRunId: string,
+  compatibilityScanRunId: string,
+  acquire: () => Promise<TransactionClient> = () => ingestPool().connect() as Promise<TransactionClient>,
+): Promise<string> {
+  const client = await acquire();
+  try {
+    await client.query('BEGIN');
+    try {
+      const inserted = await client.query(
+        `INSERT INTO mcp_tool_captures
+           (server_id, endpoint_url, captured_at, status, http_status,
+            response_time_ms, error_class, tool_count, page_count, truncated,
+            raw_json, raw_bytes, token_estimate, cache_ttl_ms,
+            protocol_version, list_changed, note, scan_run_id,
+            tool_collection_run_id, persistence_state,
+            observed_tool_count, persisted_tool_count)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,'COMPLETE',$20,$20)
+         RETURNING id`,
+        [c.server_id, c.endpoint_url, c.captured_at, c.status, c.http_status,
+          c.response_time_ms, c.error_class, c.tool_count, c.page_count, c.truncated,
+          c.raw_json === null ? null : JSON.stringify(c.raw_json),
+          c.raw_bytes, c.token_estimate, c.cache_ttl_ms,
+          c.protocol_version, c.list_changed, c.note, compatibilityScanRunId,
+          toolCollectionRunId, c.tools.length],
+      );
+      const captureId = inserted.rows[0]?.id;
+      if (!captureId) throw new Error('capture insert returned no id');
+      if (c.tools.length > 0) {
+        const width = TOOL_COLS.length;
+        const values: unknown[] = [];
+        const tuples = c.tools.map((t, row) => {
+          const data = [
+            captureId, c.server_id, c.endpoint_url, t.tool_name, t.tool_title,
+            t.description,
+            t.input_schema === null ? null : JSON.stringify(t.input_schema),
+            t.output_schema === null ? null : JSON.stringify(t.output_schema),
+            t.schema_hash, t.contract_hash,
+            t.param_set === null ? null : JSON.stringify(t.param_set),
+            t.param_count, t.required_count, t.max_depth,
+            t.type_union, t.union_via_composition, t.has_ref, t.has_defs,
+            t.annotations === null ? null : JSON.stringify(t.annotations),
+            t.token_estimate,
+          ];
+          values.push(...data);
+          return `(${data.map((_, col) => `$${row * width + col + 1}`).join(',')})`;
+        });
+        await client.query(`INSERT INTO mcp_tools (${TOOL_COLS.join(',')}) VALUES ${tuples.join(',')}`, values);
+      }
+      await client.query('COMMIT');
+      return captureId;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /* ---------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------ */
@@ -506,6 +683,18 @@ export async function collectMcpTools(): Promise<{
 }> {
   const startedAt = new Date();
   let errors = 0;
+
+  // Mandatory fail-closed boundary: the durable run exists before target
+  // selection, exclusion loading, scheduler construction, or network work.
+  const begun = await beginToolCollection(q, loadTargets, startedAt, provenanceFromEnvironment());
+  const TOOL_COLLECTION_RUN_ID = begun.runId;
+  const initialSelection = begun.selection;
+  const runCounts: ToolRunCounts = {
+    expected: 0, eligible: 0, attempted: 0, completed: 0,
+    persisted: 0, notAttempted: 0, failedInternal: 0, excluded: 0,
+  };
+
+  try {
 
   /**
    * ONE ID PER RUN, stamped on every capture row.
@@ -549,7 +738,7 @@ export async function collectMcpTools(): Promise<{
   }
   const deadlineAt = startedAt.getTime() + deadlineParsed.value * 60_000;
 
-  const { targets: all, excluded } = await loadTargets();
+  const { targets: all, excluded } = initialSelection;
 
   // THE DISCLOSURE PROMISE, ASSERTED. The page says tools/list goes only to
   // endpoints that answered without requiring a session. That is true by
@@ -583,6 +772,13 @@ export async function collectMcpTools(): Promise<{
     console.log(`[collect-mcp-tools] TOOLS_LIMIT=${limitParsed.value} -- SMOKE RUN, NOT a full sweep`);
   }
 
+  const discoveryExcluded = Object.values(excluded).reduce((sum, n) => sum + n, 0);
+  runCounts.expected = all.length + discoveryExcluded;
+  runCounts.eligible = targets.length;
+  runCounts.excluded = runCounts.expected - runCounts.eligible;
+  runCounts.notAttempted = runCounts.eligible;
+  await updateToolCollectionRun(q, TOOL_COLLECTION_RUN_ID, 'RUNNING', runCounts, null);
+
   /* ── operator opt-outs ──────────────────────────────────────────────────────
    *
    * Loaded ONCE, here: the target set is final and nothing has been dialled yet.
@@ -610,6 +806,10 @@ export async function collectMcpTools(): Promise<{
     else dialable.push(t);
   }
   targets = dialable;
+  runCounts.eligible = targets.length;
+  runCounts.excluded = runCounts.expected - runCounts.eligible;
+  runCounts.notAttempted = runCounts.eligible;
+  await updateToolCollectionRun(q, TOOL_COLLECTION_RUN_ID, 'RUNNING', runCounts, null);
   console.log(
     `[collect-mcp-tools] exclusions: ${optOutSet.count} active rule(s) -- ` +
     `${optOutTargets.length} of ${corpusSize} endpoints excluded and NOT dialled ` +
@@ -633,14 +833,6 @@ export async function collectMcpTools(): Promise<{
   // matches the live INSERT is worse than no list, because the next person to add
   // a column updates the array, sees the tests pass, and never touches the
   // statement that actually runs.
-  const TOOL_COLS = [
-    'capture_id', 'server_id', 'endpoint_url', 'tool_name', 'tool_title',
-    'description', 'input_schema', 'output_schema', 'schema_hash',
-    'contract_hash', 'param_set', 'param_count', 'required_count', 'max_depth',
-    'type_union', 'union_via_composition', 'has_ref', 'has_defs',
-    'annotations', 'token_estimate',
-  ];
-
   const byStatus: Record<string, number> = {};
   const driftAll: FalseDriftClasses[] = [];
   let capturesWritten = 0;
@@ -650,8 +842,8 @@ export async function collectMcpTools(): Promise<{
 
   /**
    * Captures and their tools are written together, capture first, because
-   * mcp_tools.capture_id is a FK. insertRows returns nothing useful for ids, so
-   * each capture is inserted with RETURNING id via q() and its tools follow.
+   * mcp_tools.capture_id is a FK. Each capture and all of its tools are written
+   * on one pinned connection and committed atomically.
    */
   const flush = async (): Promise<void> => {
     if (pending.length === 0) return;
@@ -659,46 +851,13 @@ export async function collectMcpTools(): Promise<{
     pending = [];
     for (const c of chunk) {
       try {
-        const inserted = await q<{ id: string }>(
-          `INSERT INTO mcp_tool_captures
-             (server_id, endpoint_url, captured_at, status, http_status,
-              response_time_ms, error_class, tool_count, page_count, truncated,
-              raw_json, raw_bytes, token_estimate, cache_ttl_ms,
-              protocol_version, list_changed, note, scan_run_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-           RETURNING id`,
-          [
-            c.server_id, c.endpoint_url, c.captured_at, c.status, c.http_status,
-            c.response_time_ms, c.error_class, c.tool_count, c.page_count, c.truncated,
-            c.raw_json === null ? null : JSON.stringify(c.raw_json),
-            c.raw_bytes, c.token_estimate, c.cache_ttl_ms,
-            c.protocol_version, c.list_changed, c.note,
-            // Stamped from the closure, not per row, so every capture in a run
-            // carries the same value by construction -- including the excluded
-            // ones and the probe_exception ones, which flow through this same
-            // path. A per-row field could diverge; a closure constant cannot.
-            RUN_ID,
-          ],
-        );
+        await persistCaptureAtomically(c, TOOL_COLLECTION_RUN_ID, RUN_ID);
         capturesWritten++;
-        const captureId = inserted[0]?.id;
-        if (captureId && c.tools.length > 0) {
-          await insertRows('mcp_tools', TOOL_COLS, c.tools.map((t) => [
-            captureId, c.server_id, c.endpoint_url, t.tool_name, t.tool_title,
-            t.description,
-            t.input_schema === null ? null : JSON.stringify(t.input_schema),
-            t.output_schema === null ? null : JSON.stringify(t.output_schema),
-            t.schema_hash, t.contract_hash,
-            t.param_set === null ? null : JSON.stringify(t.param_set),
-            t.param_count, t.required_count, t.max_depth,
-            t.type_union, t.union_via_composition, t.has_ref, t.has_defs,
-            t.annotations === null ? null : JSON.stringify(t.annotations),
-            t.token_estimate,
-          ]));
-          toolsWritten += c.tools.length;
-        }
+        toolsWritten += c.tools.length;
+        if (c.status !== 'excluded') runCounts.persisted++;
       } catch (err) {
         errors++;
+        if (c.status !== 'excluded') runCounts.failedInternal++;
         console.error('[collect-mcp-tools] insert failed for', c.endpoint_url, err instanceof Error ? err.message : err);
       }
     }
@@ -793,6 +952,9 @@ export async function collectMcpTools(): Promise<{
         }
         pending.push(capture);
         seen++;
+        runCounts.attempted++;
+        runCounts.completed++;
+        runCounts.notAttempted--;
         if (pending.length >= INSERT_CHUNK) await flush();
         if (seen % 50 === 0) {
           const s = sched.stats();
@@ -815,6 +977,14 @@ export async function collectMcpTools(): Promise<{
   const hs = sched.stats();
   const truncatedCount = Object.entries(byStatus).length ? undefined : undefined;
 
+  const terminalState = runCounts.notAttempted === 0 && runCounts.failedInternal === 0 && errors === 0 && !sweepError
+    ? 'COMPLETE'
+    : runCounts.persisted > 0 ? 'PARTIAL' : 'FAILED';
+  await updateToolCollectionRun(
+    q, TOOL_COLLECTION_RUN_ID, terminalState, runCounts,
+    sweepError ? 'COLLECTOR_ABORTED' : runCounts.notAttempted > 0 ? 'RUN_INCOMPLETE' : runCounts.failedInternal > 0 || errors > 0 ? 'CAPTURE_PERSISTENCE_FAILED' : null,
+  );
+
   await logIngestionPg({
     sourceSlug: SOURCE_SLUG,
     startedAt,
@@ -827,6 +997,7 @@ export async function collectMcpTools(): Promise<{
       // time-window join, and smoke_run below applies to a set of rows that can
       // be named rather than inferred.
       run_id: RUN_ID,
+      tool_collection_run_id: TOOL_COLLECTION_RUN_ID,
       // `endpoints` is the CORPUS after TOOLS_LIMIT, not the dialled set:
       // endpoints - endpoints_excluded_by_operator is what was dialled.
       endpoints: corpusSize, hosts: hs.hosts, by_status: byStatus,
@@ -865,6 +1036,18 @@ export async function collectMcpTools(): Promise<{
   if (sweepError) throw sweepError;
   void truncatedCount;
   return { attempted: seen, captures: capturesWritten, tools: toolsWritten, errors, byStatus, drift };
+  } catch (err) {
+    // The run row already exists. Preserve a structured terminal record even
+    // when selection, exclusions, configuration, or collector orchestration
+    // aborts before the normal reconciliation path.
+    try {
+      const state = runCounts.persisted > 0 ? 'PARTIAL' : 'FAILED';
+      await updateToolCollectionRun(q, TOOL_COLLECTION_RUN_ID, state, runCounts, 'COLLECTOR_ABORTED');
+    } catch (closeErr) {
+      console.error('[collect-mcp-tools] failed to finalize authoritative tool run:', closeErr instanceof Error ? closeErr.message : closeErr);
+    }
+    throw err;
+  }
 }
 
 if (require.main === module) {

@@ -268,6 +268,10 @@ jobs:
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
           TOOLS_LIMIT: ${{ inputs.tools_limit }}
+          AIVE_TOOL_TRIGGER_KIND: ${{ github.event_name == 'schedule' && 'SCHEDULED' || 'MANUAL' }}
+          AIVE_TOOL_WORKFLOW_RUN_ID: ${{ github.run_id }}
+          AIVE_TOOL_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          AIVE_TOOL_COLLECTOR_VERSION: ${{ github.sha }}
         run: npm run collect:mcp-tools
 
       - name: Collect resources/list

@@ -114,9 +114,18 @@ const fakeDb = {
         if (!/effective_at <= now\(\)/.test(text)) throw new Error('db double: query is missing the effective_at predicate');
         return { rows: ACTIVE_RULES as unknown[] };
       },
+      connect: async () => ({
+        query: async (text: string, params?: unknown[]) => {
+          if (text === 'BEGIN' || text === 'COMMIT' || text === 'ROLLBACK') return { rows: [] };
+          return { rows: await fakeDb.q(text, params) };
+        },
+        release() { /* fixture connection */ },
+      }),
     };
   },
   async q(text: string, params?: unknown[]): Promise<unknown[]> {
+    if (/INSERT INTO mcp_tool_collection_runs/.test(text)) return [{ id: 'fixture-tool-collection-run' }];
+    if (/UPDATE mcp_tool_collection_runs/.test(text)) return [];
     if (/INSERT INTO scan_runs/.test(text)) return [{ id: 'fixture-scan-run' }];
     if (/UPDATE scan_runs/.test(text)) {
       written.scanRunStatus = String((params ?? [])[2] ?? '');
@@ -154,6 +163,7 @@ const fakeDb = {
       });
       return [{ id: `cap-${written.captures.length}` }];
     }
+    if (/INSERT INTO mcp_tools/.test(text)) return [];
     throw new Error(`db double: unrecognised SQL (refusing to return [] and let a check pass): ${text.slice(0, 140)}`);
   },
   async insertRows(table: string, cols: string[], rows: unknown[][]): Promise<void> {
