@@ -141,9 +141,32 @@ async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
   return pick();
 }
 
-/** Has this account already been posted to today? The one-post-per-day cap. */
-async function alreadyPostedToday(): Promise<boolean> {
-  const rows = await q<{ n: string }>(
+/* Hard ceiling across BOTH formats for this account, per UTC day. Kept
+   identical to the same constant in broadcast-text-card.ts. */
+const MAX_POSTS_PER_DAY = 3;
+
+/**
+ * Should this run stand down? Two separate reasons, and they are not the same
+ * question.
+ *
+ * THIS USED TO COUNT EVERY JOB FOR THE ACCOUNT and stop if there was one. That
+ * was correct while video was the only format. Once text cards began posting
+ * at 10:00 UTC, a card would have made this true and SILENTLY SUPPRESSED the
+ * 14:00 video every single day — the daily video would simply have stopped,
+ * with a green run saying "daily cap holds". Scheduling around it is not a fix
+ * either: GitHub's dispatch on this repo drifts by hours, so no ordering of
+ * cron times can be relied on.
+ *
+ * So the two questions are asked separately:
+ *   - has a VIDEO gone out today? That is this worker's own cadence, and
+ *     broadcast_topic_queue.used_at is the marker, written only on a confirmed
+ *     post. A card does not touch it.
+ *   - is the account at its overall ceiling? broadcast_jobs is authoritative
+ *     for that: it counts posts of any format, including anything sent by
+ *     hand, which the queue columns cannot see.
+ */
+async function standDownReason(): Promise<string | null> {
+  const [jobs] = await q<{ n: string }>(
     `SELECT count(*)::text AS n
        FROM broadcast_job_accounts ja
        JOIN broadcast_jobs j ON j.id = ja.job_id
@@ -152,7 +175,20 @@ async function alreadyPostedToday(): Promise<boolean> {
         AND j.status IN ('posted', 'pending_api')`,
     [MISTER_MCP_A2A],
   );
-  return Number(rows[0]?.n ?? '0') > 0;
+  const [queue] = await q<{ videos: string; cards: string }>(
+    `SELECT
+       count(*) FILTER (WHERE used_at        >= date_trunc('day', now() AT TIME ZONE 'UTC'))::text AS videos,
+       count(*) FILTER (WHERE card_posted_at >= date_trunc('day', now() AT TIME ZONE 'UTC'))::text AS cards
+       FROM broadcast_topic_queue`,
+  );
+  const total = Number(jobs?.n ?? '0');
+  const videos = Number(queue?.videos ?? '0');
+  const cards = Number(queue?.cards ?? '0');
+  console.log(`[broadcast-daily] today so far — videos=${videos} cards=${cards} total_jobs=${total} (ceiling ${MAX_POSTS_PER_DAY})`);
+
+  if (videos > 0) return 'a video has already gone out today';
+  if (total >= MAX_POSTS_PER_DAY) return `account is at its ${MAX_POSTS_PER_DAY}-post daily ceiling`;
+  return null;
 }
 
 /** Start generation. Returns the creation id. */
@@ -254,9 +290,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (await alreadyPostedToday()) {
+  const standDown = await standDownReason();
+  if (standDown) {
     // Not a failure: the cap did its job. Exit 0 so a double-fire is quiet.
-    console.log('[broadcast-daily] mister.mcp.a2a already has a post today — daily cap holds, nothing sent');
+    console.log(`[broadcast-daily] standing down — ${standDown}; nothing sent`);
     return;
   }
 

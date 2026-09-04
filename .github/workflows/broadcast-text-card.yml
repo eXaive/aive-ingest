@@ -1,0 +1,106 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Broadcast Text Card — twice-daily rendered quote image to the
+# mister.mcp.a2a TikTok account.
+#
+# SEPARATE FROM THE VIDEO WORKFLOW, NOT A MODE OF IT. Different cadence,
+# different rotation cursor, different cost profile, different failure mode.
+# The video costs ~45-50 credits a render and goes out once a day; this costs
+# ZERO — the Single Centered Text Quote template is pure text rendering, no AI
+# image, video or voice step (measured 2026-09-03: 1520 credits before, 1520
+# after a full render). That is what makes twice a day affordable.
+#
+# CADENCE: 10:00 and 19:00 UTC. Clear of every ingest slot (03:00-08:00), the
+# watchdog (12:00) and the daily video (14:00).
+#
+# THE SCHEDULE IS NOT WHAT KEEPS THE FORMATS APART. GitHub's scheduled
+# dispatch drifts by hours on this repo — a 05:00 cron has started as late as
+# 17:08 — so a 10:00 card can easily land after a 14:00 video, or vice versa.
+# Separation is enforced in the DATA instead: each worker counts today's posts
+# by format (broadcast_topic_queue.used_at for video, .card_posted_at for
+# cards) and stands down on its own rules. The times below are for spacing the
+# feed, not for correctness.
+#
+# CAPS. At most 2 cards and 3 total posts per account per UTC day, checked by
+# the worker before it renders anything. Hitting a cap EXITS 0, not 1: a cap
+# doing its job is not a failure, and a red run for "already posted enough
+# today" is how a red run stops meaning anything.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints status
+# codes and named fields only — never a response body, never a job row.
+# GitHub masks ${{ secrets.X }} but cannot mask a secret echoed inside a
+# payload the script logs.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
+# workflow holds a database credential, a publishing API key and the app's
+# owner secret, and must not be reachable from forks.
+#
+# Required repo secrets (the same four the video workflow uses):
+#   AIVE_INGEST_DATABASE_URL  scoped aive_ingest role (SELECT/UPDATE on
+#                             broadcast_topic_queue, SELECT on the job tables)
+#   BLOTATO_API_KEY           card rendering
+#   AIVE_CRON_SECRET          Bearer for the app's requireOwnerAuth
+#   AIVE_BASE_URL             deployed app origin, e.g. https://aive.global
+#                             (a SECRET, not a variable — reading it as
+#                             ${{ vars.* }} yields an empty string and the
+#                             worker fails on requireEnv)
+#
+# NOTE: the deployed app must have DISTRIBUTION_MODE=live for anything to
+# reach TikTok. With it unset the StubAdapter accepts the job and returns
+# status=pending_api; the worker treats anything other than 'posted' as a
+# failure, so a stub deployment is a RED run rather than a green one that
+# quietly published nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Broadcast Text Card
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_today:
+        description: 'Skip this run without consuming a topic (1 = skip)'
+        required: false
+        default: ''
+      force_topic:
+        description: 'Exact topic_name to use instead of the rotation (e.g. MCP)'
+        required: false
+        default: ''
+
+concurrency:
+  # Never two of these at once. The worker also counts today's posts in the
+  # database, so a double-fire is caught even across separate runs; this is
+  # the cheaper first line of defence.
+  group: broadcast-text-card
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    # Text rendering finished on the first 5s poll when measured. 15 minutes is
+    # far more than needed and still cannot leave a half-finished publish
+    # hanging: staging and dispatch are single calls after the render.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Render and post text card
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          BLOTATO_API_KEY: ${{ secrets.BLOTATO_API_KEY }}
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          BROADCAST_SKIP_TODAY: ${{ inputs.skip_today }}
+          BROADCAST_FORCE_TOPIC: ${{ inputs.force_topic }}
+        run: npx tsx workers/broadcast-text-card.ts
