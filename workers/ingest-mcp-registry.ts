@@ -64,6 +64,7 @@ export interface ScanProgress {
   retries:        number; // total retries (429 + 5xx)
   retries429:     number; // rate-limit retries
   retries5xx:     number; // upstream-error retries
+  retriesTransport: number; // timeout / socket / DNS retries (no HTTP status)
   fetchMs:        number; // cumulative ms inside fetch() calls
   sleepMs:        number; // cumulative ms in inter-page pacing sleep
   backoffMs:      number; // cumulative ms in retry backoff sleep
@@ -188,6 +189,11 @@ function semverGt(a: string | null | undefined, b: string | null | undefined): b
 
 const INTER_PAGE_DELAY_MS = 250;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000]; // max 3 retry attempts
+/* Per-request ceiling. Run #42 breached it when the registry degraded to
+   ~8.9s/page; it is deliberately NOT raised here, because a longer timeout
+   only delays the same failure. What changed is that breaching it is now
+   retryable and no longer discards the scan. */
+const FETCH_TIMEOUT_MS = 30_000;
 
 /** Worth asking again for the same page: rate limiting, or the far side faltering. */
 export function isRetryableStatus(status: number): boolean {
@@ -207,19 +213,89 @@ function retryAfterMs(res: Response): number | null {
   return null;
 }
 
+// ── transport retry (added 2026-09-04 after run #42) ───────────────────────
+// The 09-02 pass taught the ladder to retry 5xx. Run #42 then failed on
+// something the ladder never saw: the registry slowed from ~1.5s to ~8.9s per
+// page, one request passed the 30s AbortSignal, and fetch() THREW. A throw
+// carries no HTTP status, so isRetryableStatus was never consulted — zero
+// retries were attempted (backoff_ms=0) — and the throw unwound out of
+// fetchAllItems, destroying its accumulator. 342 pages and ~34,200 servers
+// were reported as `fetched: 0`.
+//
+// A timeout, a socket reset and a DNS blip call for exactly the response a
+// 5xx does: wait, ask for the SAME page again. So they now share the ladder.
+// The difference is only in what comes back — there is no Response to hand to
+// the caller — so exhaustion throws TransportFailure, which fetchAllItems
+// catches inside its loop and turns into a PARTIAL.
+
+/** Retries exhausted with no HTTP response at all. Distinct from a bad status. */
+export class TransportFailure extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TransportFailure';
+  }
+}
+
+/** A short, log-safe description. Never includes the URL — it carries no
+ *  secret today, but this log is public and error objects are not curated. */
+function describeTransportError(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as { cause?: { code?: string } }).cause;
+    const code = typeof cause?.code === 'string' ? ` (${cause.code})` : '';
+    return `${err.name}: ${err.message}${code}`;
+  }
+  return String(err);
+}
+
 /**
- * Fetch one page. On 429 or 5xx: back off and retry the SAME page (never the
- * next one) up to RETRY_BACKOFF_MS.length times, preferring Retry-After when
- * the registry sends it. Returns the final Response — a still-failing response
- * after exhaustion is returned to the caller, whose !ok check ends pagination.
+ * Fetch one page. On 429, 5xx, OR a transport throw: back off and retry the
+ * SAME page (never the next one) up to RETRY_BACKOFF_MS.length times,
+ * preferring Retry-After when the registry sends it.
+ *
+ * Returns the final Response — a still-failing response after exhaustion is
+ * returned to the caller, whose !ok check ends pagination. Exhausting the
+ * ladder on transport errors THROWS TransportFailure instead, because there is
+ * no Response to return; the caller treats both the same way.
  */
-export async function fetchPageWithRetry(url: string, progress: ScanProgress): Promise<Response> {
+export async function fetchPageWithRetry(
+  url: string,
+  progress: ScanProgress,
+  /* Overridable for tests only. A real abort takes 30s to reproduce, which
+     makes the transport path effectively untestable at the default; the
+     verify script drives it at a few hundred ms. A parameter rather than an
+     env var, for the same reason baseUrl is: an env hook would be a live
+     production switch that exists only for tests. */
+  timeoutMs: number = FETCH_TIMEOUT_MS,
+): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
     const tFetch = Date.now();
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'AIVE/1.0 (aive.global)', Accept: 'application/json' },
-      signal: AbortSignal.timeout(30_000),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { 'User-Agent': 'AIVE/1.0 (aive.global)', Accept: 'application/json' },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      progress.fetchMs += Date.now() - tFetch;
+      const detail = describeTransportError(err);
+      // Exhausted: no Response exists, so this cannot be returned. Throw, and
+      // let fetchAllItems keep the pages it already has.
+      if (attempt >= RETRY_BACKOFF_MS.length) {
+        throw new TransportFailure(detail);
+      }
+      // Retry-After is unavailable here — there are no headers to read.
+      const waitMs = RETRY_BACKOFF_MS[attempt];
+      progress.retries++;
+      progress.retriesTransport++;
+      console.log(
+        `[ingest-mcp-registry] transport page=${progress.pagesAttempted} attempt=${attempt + 1}/${RETRY_BACKOFF_MS.length} ` +
+        `backoff_ms=${waitMs} (${detail}) — halting pagination; retrying this page`,
+      );
+      const tBackoff = Date.now();
+      await sleep(waitMs);
+      progress.backoffMs += Date.now() - tBackoff;
+      continue;
+    }
     progress.fetchMs += Date.now() - tFetch;
     if (!isRetryableStatus(res.status)) return res;
     if (attempt >= RETRY_BACKOFF_MS.length) return res; // exhausted → caller halts
@@ -270,6 +346,8 @@ export async function fetchAllItems(
      and pointing the daily ingest at an arbitrary host is not a capability
      worth shipping to save a line here. */
   baseUrl: string = REGISTRY_BASE,
+  /* Test seam, same rationale as baseUrl — see fetchPageWithRetry. */
+  timeoutMs: number = FETCH_TIMEOUT_MS,
 ): Promise<FetchOutcome> {
   const all: MCPRegistryItem[] = [];
   let cursor: string | null = startCursor;
@@ -284,7 +362,26 @@ export async function fetchAllItems(
 
     progress.pagesAttempted++;
     progress.lastCursor = cursor;
-    const res = await fetchPageWithRetry(url.toString(), progress);
+
+    /* THE CATCH IS INSIDE THE LOOP, and that placement is the whole fix.
+       `all` is declared outside it, so returning from here keeps every page
+       fetched so far. Letting the throw escape the function instead is what
+       turned run #42's 342 pages into `fetched: 0` — the accumulator was a
+       local that died with the stack frame. Retries are already exhausted by
+       the time TransportFailure is raised. */
+    let res: Response;
+    try {
+      res = await fetchPageWithRetry(url.toString(), progress, timeoutMs);
+    } catch (err) {
+      return {
+        items: all,
+        complete: false,
+        failure: err instanceof TransportFailure
+          ? `Transport failure after ${RETRY_BACKOFF_MS.length} retries: ${err.message}`
+          : describeTransportError(err),
+        resumeCursor: cursor,
+      };
+    }
 
     /* Retries are exhausted. Pagination halts here — but everything already
        fetched is HANDED BACK, not thrown away. Before 2026-09-02 this threw,
@@ -299,7 +396,21 @@ export async function fetchAllItems(
       };
     }
 
-    const page: RegistryPage = await res.json();
+    /* A malformed body is the same class of loss: json() throws, and without
+       this the accumulator would die exactly as it did on run #42. Not
+       retried — a 200 that will not parse is unlikely to parse next time. */
+    let page: RegistryPage;
+    try {
+      page = await res.json() as RegistryPage;
+    } catch (err) {
+      return {
+        items: all,
+        complete: false,
+        failure: `Registry 200 with unreadable body: ${describeTransportError(err)}`,
+        resumeCursor: cursor,
+      };
+    }
+
     progress.pages++;
     all.push(...(page.servers ?? []));
     cursor = page.metadata?.nextCursor ?? null;
@@ -385,7 +496,7 @@ export async function ingestMCPRegistry(
   const startedAt = new Date();
   const scanRunId = await openScanRun(startedAt);
   const progress: ScanProgress = {
-    pages: 0, pagesAttempted: 0, retries: 0, retries429: 0, retries5xx: 0,
+    pages: 0, pagesAttempted: 0, retries: 0, retries429: 0, retries5xx: 0, retriesTransport: 0,
     fetchMs: 0, sleepMs: 0, backoffMs: 0, lastCursor: null,
   };
   let upserted = 0, snapshots = 0, errors = 0;
@@ -429,12 +540,14 @@ export async function ingestMCPRegistry(
   try {
     fetchOutcome = await fetchAllItems(progress, updatedSince, resumeCursor);
   } catch (err: unknown) {
-    /* A THROW here is not an HTTP failure — those come back as
-       complete:false with the pages already fetched. This is a network-layer
-       fault (DNS, socket reset, the 30s AbortSignal) or a malformed body, and
-       it loses the in-flight page's accumulator, so it stays a total failure.
-       Closing that gap means moving accumulation out of fetchAllItems; the
-       HTTP path is what actually broke on 09-02 and is what this pass fixes. */
+    /* LAST RESORT ONLY, and it should now be unreachable. Every failure this
+       used to swallow — the 30s abort, DNS, socket resets, a malformed body —
+       is caught inside fetchAllItems' loop and returned as a PARTIAL with the
+       pages intact. This comment previously said such a throw "stays a total
+       failure" and named the AbortSignal as a known gap; run #42 then hit that
+       exact gap and discarded 342 pages. Anything still landing here is a
+       fault nothing anticipated, so it fails whole and loud rather than
+       reporting a partial it cannot vouch for. */
     fetchOutcome = {
       items: [], complete: false,
       failure: err instanceof Error ? err.message : String(err),
@@ -456,7 +569,7 @@ export async function ingestMCPRegistry(
     const kind = msg.startsWith('Registry 429') ? 'error rate_limited (retries exhausted)' : 'error';
     const scanStatus =
       `${kind} pages_completed=${progress.pages} pages_attempted=${progress.pagesAttempted}` +
-      (progress.retries > 0 ? ` retries=${progress.retries} (429=${progress.retries429} 5xx=${progress.retries5xx})` : '') +
+      (progress.retries > 0 ? ` retries=${progress.retries} (429=${progress.retries429} 5xx=${progress.retries5xx} transport=${progress.retriesTransport})` : '') +
       ' — total failure';
     await closeScanRun(scanRunId, { pages_fetched: progress.pages, servers_returned: null, status: scanStatus });
     await logIngestionPg({ sourceSlug: SOURCE_SLUG, startedAt, errorMessage: msg });
@@ -687,7 +800,7 @@ export async function ingestMCPRegistry(
   const ingestElapsedMs = Date.now() - startedAt.getTime();
 
   const retryNote = progress.retries > 0
-    ? ` (recovered after ${progress.retries} ${progress.retries === 1 ? 'retry' : 'retries'}: 429=${progress.retries429} 5xx=${progress.retries5xx})`
+    ? ` (recovered after ${progress.retries} ${progress.retries === 1 ? 'retry' : 'retries'}: 429=${progress.retries429} 5xx=${progress.retries5xx} transport=${progress.retriesTransport})`
     : '';
   await closeScanRun(scanRunId, {
     pages_fetched:    progress.pages,
@@ -826,6 +939,7 @@ export async function ingestMCPRegistry(
       mode, updated_since: updatedSince, filtered: latest.length, pages: progress.pages, snapshots,
       ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
       retries: progress.retries, retries_429: progress.retries429, retries_5xx: progress.retries5xx,
+      retries_transport: progress.retriesTransport,
       resume_cursor: fetchOutcome.resumeCursor,
       partial_version_guard_skipped: partialVersionSkips,
       ...outcome,
@@ -841,7 +955,7 @@ export async function ingestMCPRegistry(
     `reachability_refresh_ms=${outcome.reachability_refresh_ms} overall_status=${outcome.overall_status} ` +
     `ingest_elapsed_ms=${ingestElapsedMs} total_elapsed_ms=${totalElapsedMs} ` +
     `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs} ` +
-    `retries=${progress.retries} (429=${progress.retries429} 5xx=${progress.retries5xx})`,
+    `retries=${progress.retries} (429=${progress.retries429} 5xx=${progress.retries5xx} transport=${progress.retriesTransport})`,
   );
   return {
     fetched: allItems.length, filtered: latest.length, pages: progress.pages,
