@@ -46,4 +46,8 @@ jobs:
       - name: Run endpoint probes
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          AIVE_PROBE_TRIGGER_KIND: ${{ github.event_name == 'schedule' && 'SCHEDULED' || 'MANUAL' }}
+          AIVE_PROBE_WORKFLOW_RUN_ID: ${{ github.run_id }}
+          AIVE_PROBE_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          AIVE_PROBE_COLLECTOR_VERSION: ${{ github.sha }}
         run: npx tsx workers/probe-mcp-endpoints.ts

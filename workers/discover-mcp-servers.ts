@@ -1134,6 +1134,7 @@ export async function discoverMcpServers(): Promise<{
     'server_id', 'endpoint_url', 'probed_at', 'http_status', 'response_time_ms',
     'error_class', 'tls_valid', 'note', 'probe_method', 'content_type',
     'protocol_versions', 'version_source', 'discover_status', 'discover_raw',
+    'observation_kind',
   ];
   const byStatus: Record<string, number> = {};
   let written = 0;
@@ -1154,6 +1155,7 @@ export async function discoverMcpServers(): Promise<{
         r.version_source,
         r.discover_status,
         r.discover_raw === null || r.discover_raw === undefined ? null : JSON.stringify(r.discover_raw),
+        'PROTOCOL_DISCOVERY',
       ]));
       written += chunk.length;
     } catch (err) {

@@ -49,6 +49,10 @@ const RATE_LIMIT_BACKOFF_MS = 5_000; // extra host spacing after a 429
 const TIMEOUT_MS = 10_000;
 const MAX_REDIRECTS = 2;
 const INSERT_CHUNK = 500;
+export const PROBE_VANTAGE_ID = 'github-actions-default';
+export const COLLECTOR_ENVIRONMENT = 'github_actions';
+export const PROBE_POLICY_VERSION = 'mcp-reachability-v1';
+export const ERROR_TAXONOMY_VERSION = 'mcp-reachability-errors-v1';
 
 // Ephemeral tunnel hosts: probed normally, flagged in note (a tunnel that is
 // up today proves nothing about tomorrow — the flag lets readers segment).
@@ -93,7 +97,7 @@ function pickAllowlistedHeaders(h: Headers): Record<string, string> | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-interface ProbeRow {
+export interface ProbeRow {
   server_id: string;
   endpoint_url: string;
   probed_at: string;
@@ -163,7 +167,7 @@ async function fetchOnce(url: string, method: 'HEAD' | 'GET') {
   return res;
 }
 
-async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
+export async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
   const probedAt = new Date().toISOString();
   const base: ProbeRow = {
     server_id: serverId, endpoint_url: url, probed_at: probedAt,
@@ -274,9 +278,9 @@ async function probeEndpoint(serverId: string, url: string): Promise<ProbeRow> {
 }
 
 // ── scan_runs bookkeeping (same pattern as the four ingest workers) ─────────
-async function openScanRun(startedAt: Date): Promise<string | null> {
+async function openScanRun(startedAt: Date, query: typeof q = q): Promise<string | null> {
   try {
-    const rows = await q<{ id: string }>(
+    const rows = await query<{ id: string }>(
       "INSERT INTO scan_runs (started_at, status) VALUES ($1, 'running') RETURNING id",
       [startedAt.toISOString()],
     );
@@ -287,16 +291,110 @@ async function openScanRun(startedAt: Date): Promise<string | null> {
   }
 }
 
-async function closeScanRun(id: string | null, fields: { pages_fetched: number | null; servers_returned: number | null; status: string }): Promise<void> {
+async function closeScanRun(id: string | null, fields: { pages_fetched: number | null; servers_returned: number | null; status: string }, query: typeof q = q): Promise<void> {
   if (!id) return;
   try {
-    await q(
+    await query(
       'UPDATE scan_runs SET finished_at = now(), pages_fetched = $2, servers_returned = $3, status = $4 WHERE id = $1',
       [id, fields.pages_fetched, fields.servers_returned, fields.status],
     );
   } catch (err) {
     console.error('[probe-mcp-endpoints] scan_runs update failed:', err instanceof Error ? err.message : err);
   }
+}
+
+type ProbeRunState = 'RUNNING' | 'COMPLETE' | 'PARTIAL' | 'FAILED' | 'CANCELLED';
+
+export interface ProbeRunProvenance {
+  scheduledFor: string | null;
+  triggerKind: 'SCHEDULED' | 'MANUAL';
+  collectorVersion: string;
+  externalWorkflowRunId: string | null;
+  externalWorkflowRunAttempt: number | null;
+}
+
+export interface ProbeExecutionDependencies {
+  query: typeof q;
+  insert: typeof insertRows;
+  probe: typeof probeEndpoint;
+  now: () => Date;
+}
+
+const defaultDependencies: ProbeExecutionDependencies = {
+  query: q,
+  insert: insertRows,
+  probe: probeEndpoint,
+  now: () => new Date(),
+};
+
+function provenanceFromEnvironment(): ProbeRunProvenance {
+  const trigger = process.env.AIVE_PROBE_TRIGGER_KIND === 'SCHEDULED' ? 'SCHEDULED' : 'MANUAL';
+  const attemptRaw = process.env.AIVE_PROBE_WORKFLOW_RUN_ATTEMPT;
+  const attempt = attemptRaw && /^\d+$/.test(attemptRaw) && Number(attemptRaw) > 0 ? Number(attemptRaw) : null;
+  const scheduledRaw = process.env.AIVE_PROBE_SCHEDULED_FOR?.trim();
+  const scheduledFor = scheduledRaw && Number.isFinite(Date.parse(scheduledRaw)) ? new Date(scheduledRaw).toISOString() : null;
+  return {
+    scheduledFor,
+    triggerKind: trigger,
+    collectorVersion: process.env.AIVE_PROBE_COLLECTOR_VERSION?.trim() || 'local-unversioned',
+    externalWorkflowRunId: process.env.AIVE_PROBE_WORKFLOW_RUN_ID?.trim() || null,
+    externalWorkflowRunAttempt: attempt,
+  };
+}
+
+async function openProbeRun(
+  startedAt: Date,
+  provenance: ProbeRunProvenance,
+  query: typeof q,
+): Promise<string> {
+  const rows = await query<{ id: string }>(
+    `INSERT INTO mcp_probe_runs (
+       started_at, scheduled_for, trigger_kind, state,
+       probe_vantage_id, collector_environment, collector_version,
+       probe_policy_version, error_taxonomy_version,
+       external_workflow_run_id, external_workflow_run_attempt
+     ) VALUES ($1,$2,$3,'RUNNING',$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+    [
+      startedAt.toISOString(), provenance.scheduledFor, provenance.triggerKind,
+      PROBE_VANTAGE_ID, COLLECTOR_ENVIRONMENT, provenance.collectorVersion,
+      PROBE_POLICY_VERSION, ERROR_TAXONOMY_VERSION,
+      provenance.externalWorkflowRunId, provenance.externalWorkflowRunAttempt,
+    ],
+  );
+  const id = rows[0]?.id;
+  if (!id) throw new Error('mcp_probe_runs insert returned no run id; refusing to probe without durable run identity');
+  return id;
+}
+
+type ProbeRunCounts = {
+  expected: number; eligible: number; attempted: number; completed: number;
+  persisted: number; notAttempted: number; failedInternal: number; excluded: number;
+};
+
+async function updateProbeRun(
+  id: string,
+  state: ProbeRunState,
+  counts: ProbeRunCounts,
+  failureCode: string | null,
+  query: typeof q,
+): Promise<void> {
+  await query(
+    `UPDATE mcp_probe_runs SET
+       completed_at = CASE WHEN $2 = 'RUNNING' THEN NULL ELSE now() END,
+       state = $2,
+       expected_endpoint_count = $3,
+       eligible_endpoint_count = $4,
+       attempted_endpoint_count = $5,
+       completed_endpoint_count = $6,
+       persisted_endpoint_count = $7,
+       not_attempted_endpoint_count = $8,
+       failed_internal_count = $9,
+       excluded_endpoint_count = $10,
+       failure_code = $11
+     WHERE id = $1`,
+    [id, state, counts.expected, counts.eligible, counts.attempted, counts.completed,
+      counts.persisted, counts.notAttempted, counts.failedInternal, counts.excluded, failureCode],
+  );
 }
 
 // ── freshness tripwire (same pattern as the ingest workers) ─────────────────
@@ -318,22 +416,34 @@ export async function assertProbeFreshness(): Promise<void> {
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
-export async function probeMcpEndpoints(): Promise<{
+export async function probeMcpEndpoints(
+  dependencies: ProbeExecutionDependencies = defaultDependencies,
+  provenance: ProbeRunProvenance = provenanceFromEnvironment(),
+): Promise<{
   probed: number; written: number; skippedDeletedServers: number; errors: number;
-  byClass: Record<string, number>;
+  byClass: Record<string, number>; probeRunId: string;
 }> {
-  const startedAt = new Date();
-  const scanId = await openScanRun(startedAt);
+  const startedAt = dependencies.now();
+  // Mandatory and fail-closed: no endpoint selection or network activity may
+  // begin until the authoritative run identity is durable.
+  const probeRunId = await openProbeRun(startedAt, provenance, dependencies.query);
+  const scanId = await openScanRun(startedAt, dependencies.query);
   let errors = 0;
+  const counts: ProbeRunCounts = {
+    expected: 0, eligible: 0, attempted: 0, completed: 0,
+    persisted: 0, notAttempted: 0, failedInternal: 0, excluded: 0,
+  };
+
+  try {
 
   // Deleted servers are skipped entirely (their endpoints are expected dead;
   // probing them would pollute the reachability signal). Count reported.
-  const skippedRows = await q<{ n: string }>(
+  const skippedRows = await dependencies.query<{ n: string }>(
     "SELECT count(*) AS n FROM mcp_servers WHERE status = 'deleted' AND remotes IS NOT NULL AND jsonb_array_length(remotes) > 0",
   );
   const skippedDeletedServers = Number(skippedRows[0]?.n ?? 0);
 
-  const servers = await q<{ id: string; remotes: { url?: string }[] }>(
+  const servers = await dependencies.query<{ id: string; remotes: { url?: string }[] }>(
     "SELECT id, remotes FROM mcp_servers WHERE status != 'deleted' AND remotes IS NOT NULL AND jsonb_array_length(remotes) > 0 ORDER BY name",
   );
 
@@ -344,6 +454,7 @@ export async function probeMcpEndpoints(): Promise<{
     }
   }
 
+  counts.expected = items.length;
   const limitParsed = parseLimit(process.env.PROBE_LIMIT, Number.MAX_SAFE_INTEGER);
   if (!limitParsed.ok || limitParsed.value === null) {
     throw new Error(`PROBE_LIMIT unreadable: ${limitParsed.problem}`);
@@ -352,6 +463,9 @@ export async function probeMcpEndpoints(): Promise<{
     console.log(`[probe-mcp-endpoints] PROBE_LIMIT=${limitParsed.value} — probing first ${limitParsed.value} of ${items.length} endpoints (smoke run, NOT a full scan)`);
     items = items.slice(0, limitParsed.value);
   }
+  counts.eligible = items.length;
+  counts.excluded = counts.expected - counts.eligible;
+  await updateProbeRun(probeRunId, 'RUNNING', counts, null, dependencies.query);
 
   console.log(`[probe-mcp-endpoints] ${servers.length} servers → ${items.length} endpoints; ${skippedDeletedServers} deleted servers skipped`);
 
@@ -359,7 +473,7 @@ export async function probeMcpEndpoints(): Promise<{
   // probes), same posture as the ingest workers' during-run chunk writes: a
   // process death mid-sweep keeps everything probed so far instead of losing
   // the hour. Insert failures are run errors (red run), never dropped silently.
-  const COLS = ['server_id', 'endpoint_url', 'probed_at', 'http_status', 'response_time_ms', 'error_class', 'tls_valid', 'redirect_target', 'note', 'probe_method', 'content_type', 'response_headers'];
+  const COLS = ['server_id', 'endpoint_url', 'probed_at', 'http_status', 'response_time_ms', 'error_class', 'tls_valid', 'redirect_target', 'note', 'probe_method', 'content_type', 'response_headers', 'probe_run_id', 'observation_kind'];
   const byClass: Record<string, number> = {};
   let written = 0;
   let pending: ProbeRow[] = [];
@@ -369,17 +483,20 @@ export async function probeMcpEndpoints(): Promise<{
     const chunk = pending;
     pending = [];
     try {
-      await insertRows('mcp_endpoint_probes', COLS, chunk.map((r) => [
+      await dependencies.insert('mcp_endpoint_probes', COLS, chunk.map((r) => [
         r.server_id, r.endpoint_url, r.probed_at, r.http_status, r.response_time_ms,
         r.error_class, r.tls_valid, r.redirect_target, r.note,
         // jsonb pre-serialized per lib/ingest/db contract (node-pg would
         // otherwise mangle objects into Postgres array/record literals).
         r.probe_method, r.content_type,
         r.response_headers ? JSON.stringify(r.response_headers) : null,
+        probeRunId, 'REACHABILITY',
       ]));
       written += chunk.length;
+      counts.persisted += chunk.length;
     } catch (err) {
       errors++;
+      counts.failedInternal += chunk.length;
       console.error(`[probe-mcp-endpoints] insert chunk (${chunk.length} rows) failed:`, err instanceof Error ? err.message : err);
     }
   };
@@ -390,10 +507,13 @@ export async function probeMcpEndpoints(): Promise<{
     while (true) {
       const i = cursor++;
       if (i >= items.length) return;
-      const row = await probeEndpoint(items[i].serverId, items[i].url);
+      const row = await dependencies.probe(items[i].serverId, items[i].url);
       byClass[row.error_class] = (byClass[row.error_class] ?? 0) + 1;
+      if (row.probe_method === null) counts.notAttempted++;
+      else counts.attempted++;
       pending.push(row);
       done++;
+      counts.completed++;
       if (pending.length >= INSERT_CHUNK) await flush();
       if (done % 500 === 0) console.log(`[probe-mcp-endpoints] ${done}/${items.length} probed`);
     }
@@ -402,11 +522,33 @@ export async function probeMcpEndpoints(): Promise<{
   await flush();
   const classStr = Object.entries(byClass).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(' ');
   const status = `${errors > 0 ? 'error' : 'ok'} probed=${items.length} ${classStr} skipped_deleted_servers=${skippedDeletedServers}`;
-  await closeScanRun(scanId, { pages_fetched: null, servers_returned: written, status });
+  const runState: ProbeRunState = counts.persisted === counts.completed
+    ? 'COMPLETE'
+    : counts.persisted > 0 ? 'PARTIAL' : 'FAILED';
+  await updateProbeRun(probeRunId, runState, counts, errors > 0 ? 'PROBE_ROW_PERSISTENCE_FAILED' : null, dependencies.query);
+  await closeScanRun(scanId, { pages_fetched: null, servers_returned: written, status }, dependencies.query);
 
   console.log(`[probe-mcp-endpoints] done — probed=${items.length} written=${written} errors=${errors}`);
   console.log(`[probe-mcp-endpoints] breakdown: ${classStr}`);
-  return { probed: items.length, written, skippedDeletedServers, errors, byClass };
+  return { probed: items.length, written, skippedDeletedServers, errors, byClass, probeRunId };
+  } catch (err) {
+    // Any completed rows not already persisted or attributed to a failed
+    // insert are censored collector losses (for example an unexpected worker
+    // exception with rows still pending in memory).
+    counts.failedInternal = counts.completed - counts.persisted;
+    const terminalState: ProbeRunState = counts.persisted > 0 ? 'PARTIAL' : 'FAILED';
+    try {
+      await updateProbeRun(probeRunId, terminalState, counts, 'COLLECTOR_ABORTED', dependencies.query);
+    } catch (closeErr) {
+      console.error('[probe-mcp-endpoints] failed to finalize authoritative run:', closeErr instanceof Error ? closeErr.message : closeErr);
+    }
+    await closeScanRun(scanId, {
+      pages_fetched: null,
+      servers_returned: counts.persisted,
+      status: `error probed=${counts.completed} collector_aborted`,
+    }, dependencies.query);
+    throw err;
+  }
 }
 
 // ── standalone runner (also the GHA daily-workflow entrypoint) ──────────────

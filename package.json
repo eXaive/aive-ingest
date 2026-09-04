@@ -24,6 +24,7 @@
     "verify:exclusions": "tsx scripts/verify-exclusions.ts",
     "verify:mcp-registry-outcome": "tsx scripts/verify-mcp-registry-outcome.ts",
     "verify:registry-retry": "tsx scripts/verify-registry-retry.ts",
+    "verify:probe-run-evidence": "tsx scripts/verify-probe-run-evidence.ts",
     "watchdog": "tsx workers/ingest-watchdog.ts",
     "broadcast:text-card": "tsx workers/broadcast-text-card.ts"
   },
