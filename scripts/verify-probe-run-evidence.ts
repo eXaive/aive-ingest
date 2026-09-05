@@ -54,10 +54,15 @@ function fixture(options: { runId: string; endpoints?: number; failInsertCall?: 
     throw new Error(`unexpected fixture query: ${sql}`);
   }) as ProbeExecutionDependencies['query'];
 
+  // Returns the count ACTUALLY inserted, mirroring lib/ingest/db.ts insertRows.
+  // The worker adds this number to written/persisted, so a stub returning
+  // nothing makes both NaN and every run reports FAILED. tsc does not catch it:
+  // a block-bodied async arrow inferring Promise<void> is accepted here.
   const insert: ProbeExecutionDependencies['insert'] = async (_table, _columns, rows) => {
     insertCall++;
     if (options.failInsertCall === insertCall) throw new Error('fixture persistence failure');
     insertedRows.push(...rows);
+    return rows.length;
   };
   const probe: ProbeExecutionDependencies['probe'] = async (serverId, url) => {
     probes++;

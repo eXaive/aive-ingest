@@ -448,10 +448,30 @@ export async function probeMcpEndpoints(
   );
 
   let items: { serverId: string; url: string }[] = [];
+  /* DE-DUP ON (server_id, url) -- the effective unique key within a run, since
+     probe_run_id and observation_kind are constant across it.
+
+     A server may declare ONE url under several transports: 87 of the 88
+     collisions on run #36 (2026-09-05) were the same address listed as both
+     "sse" and "streamable-http". Transport is neither probed nor stored (it is
+     absent from ProbeRow and COLS), so the second probe issues an identical
+     request and produces an identical row. Skipping it removes redundant
+     network work, not evidence. */
+  const seen = new Set<string>();
+  let duplicateEndpoints = 0;
   for (const s of servers) {
     for (const r of s.remotes ?? []) {
-      if (r && typeof r.url === 'string' && r.url.length > 0) items.push({ serverId: s.id, url: r.url });
+      if (!r || typeof r.url !== 'string' || r.url.length === 0) continue;
+      // NUL separator: cannot occur in a uuid or a url, so no key can collide
+      // across a boundary the way a "/" or "|" separator could.
+      const key = `${s.id}\u0000${r.url}`;
+      if (seen.has(key)) { duplicateEndpoints++; continue; }
+      seen.add(key);
+      items.push({ serverId: s.id, url: r.url });
     }
+  }
+  if (duplicateEndpoints > 0) {
+    console.log(`[probe-mcp-endpoints] ${duplicateEndpoints} duplicate (server,url) endpoint(s) collapsed — same address declared under multiple transports`);
   }
 
   counts.expected = items.length;
@@ -483,7 +503,7 @@ export async function probeMcpEndpoints(
     const chunk = pending;
     pending = [];
     try {
-      await dependencies.insert('mcp_endpoint_probes', COLS, chunk.map((r) => [
+      const inserted = await dependencies.insert('mcp_endpoint_probes', COLS, chunk.map((r) => [
         r.server_id, r.endpoint_url, r.probed_at, r.http_status, r.response_time_ms,
         r.error_class, r.tls_valid, r.redirect_target, r.note,
         // jsonb pre-serialized per lib/ingest/db contract (node-pg would
@@ -491,9 +511,24 @@ export async function probeMcpEndpoints(
         r.probe_method, r.content_type,
         r.response_headers ? JSON.stringify(r.response_headers) : null,
         probeRunId, 'REACHABILITY',
-      ]));
-      written += chunk.length;
-      counts.persisted += chunk.length;
+      ]), 'probe_run_id, server_id, endpoint_url, observation_kind');
+      /* Count what LANDED, not what was sent. DO NOTHING makes those differ,
+         and persisted feeds the COMPLETE/PARTIAL run state -- crediting a
+         skipped row would report a lossy run as complete.
+
+         On run #36 (2026-09-05) 88 duplicate rows aborted 17 whole 500-row
+         chunks, discarding 8,300 good rows for 88 bad ones. DO NOTHING caps
+         that blast radius at the offending row. */
+      written += inserted;
+      counts.persisted += inserted;
+      if (inserted < chunk.length) {
+        /* Deliberate: a collision surviving the dedup above is genuinely
+           unexpected, so it counts as failedInternal and the run reports
+           PARTIAL rather than COMPLETE. A false COMPLETE on a lossy run is
+           exactly what the run-state machinery exists to catch. */
+        counts.failedInternal += chunk.length - inserted;
+        console.error(`[probe-mcp-endpoints] ${chunk.length - inserted} row(s) in a ${chunk.length}-row chunk hit the run-unique index and were skipped`);
+      }
     } catch (err) {
       errors++;
       counts.failedInternal += chunk.length;
