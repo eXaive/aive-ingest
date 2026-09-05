@@ -90,16 +90,30 @@ export async function upsertRows<T = Record<string, unknown>>(opts: {
   return res.rows as T[];
 }
 
-/** Multi-row plain INSERT (no conflict handling, no RETURNING). */
-export async function insertRows(table: string, cols: string[], rows: unknown[][]): Promise<void> {
-  if (rows.length === 0) return;
+/**
+ * Multi-row INSERT. No RETURNING.
+ *
+ * @param conflictTarget  When set, appends ON CONFLICT (<target>) DO NOTHING.
+ *   OPT-IN, never the default: every other caller treats a duplicate as a real
+ *   error and must keep doing so. Returns the number of rows ACTUALLY inserted,
+ *   which is not rows.length when a conflict is skipped -- callers that report
+ *   persistence counts must use the return value, or a silently dropped row
+ *   reads as a written one.
+ */
+export async function insertRows(
+  table: string, cols: string[], rows: unknown[][], conflictTarget?: string,
+): Promise<number> {
+  if (rows.length === 0) return 0;
   const width = cols.length;
   const values: unknown[] = [];
   const tuples = rows.map((row, r) => {
     values.push(...row);
     return `(${row.map((_, c) => `$${r * width + c + 1}`).join(',')})`;
   });
-  await ingestPool().query(`INSERT INTO ${table} (${cols.join(',')}) VALUES ${tuples.join(',')}`, values);
+  const onConflict = conflictTarget ? ` ON CONFLICT (${conflictTarget}) DO NOTHING` : '';
+  const res = await ingestPool().query(
+    `INSERT INTO ${table} (${cols.join(',')}) VALUES ${tuples.join(',')}${onConflict}`, values);
+  return res.rowCount ?? 0;
 }
 
 /**

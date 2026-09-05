@@ -166,7 +166,11 @@ const fakeDb = {
     if (/INSERT INTO mcp_tools/.test(text)) return [];
     throw new Error(`db double: unrecognised SQL (refusing to return [] and let a check pass): ${text.slice(0, 140)}`);
   },
-  async insertRows(table: string, cols: string[], rows: unknown[][]): Promise<void> {
+  // Signature mirrors lib/ingest/db.ts insertRows: the 4th arg is the opt-in
+  // ON CONFLICT target, and the return is the count ACTUALLY inserted. This
+  // double never conflicts, so every row it accepts counts as written -- which
+  // is what lets the caller's written/persisted arithmetic be exercised here.
+  async insertRows(table: string, cols: string[], rows: unknown[][], _conflictTarget?: string): Promise<number> {
     if (table === 'mcp_endpoint_probes') {
       const ix = (c: string) => cols.indexOf(c);
       for (const r of rows) {
@@ -178,9 +182,9 @@ const fakeDb = {
           error_class: String(r[ix('error_class')]),
         });
       }
-      return;
+      return rows.length;
     }
-    if (table === 'mcp_tools') return; // not what this script is about
+    if (table === 'mcp_tools') return rows.length; // not what this script is about
     throw new Error(`db double: unexpected insertRows table ${table}`);
   },
   async endIngestPool(): Promise<void> { /* nothing to close */ },
