@@ -91,6 +91,31 @@ export async function upsertRows<T = Record<string, unknown>>(opts: {
 }
 
 /**
+ * The SQL text insertRows sends, exported so it can be asserted WITHOUT a
+ * database. The 42P10 that emptied run #37 was a defect in this string, and
+ * every test double for insertRows ignores the conflict arguments and never
+ * builds SQL -- so the suite stayed green while the statement was unrunnable.
+ * scripts/verify-insert-conflict-sql.ts asserts the text itself.
+ */
+export function buildInsertSql(
+  table: string, cols: string[], rowCount: number,
+  conflictTarget?: string, conflictWhere?: string,
+): string {
+  // A predicate with nothing to qualify is a caller bug that would otherwise
+  // emit a plain INSERT and silently drop the conflict handling.
+  if (conflictWhere && !conflictTarget) {
+    throw new Error('insertRows: conflictWhere given without conflictTarget');
+  }
+  const width = cols.length;
+  const tuples = Array.from({ length: rowCount }, (_, r) =>
+    `(${cols.map((_c, c) => `$${r * width + c + 1}`).join(',')})`);
+  const onConflict = conflictTarget
+    ? ` ON CONFLICT (${conflictTarget})${conflictWhere ? ` WHERE ${conflictWhere}` : ''} DO NOTHING`
+    : '';
+  return `INSERT INTO ${table} (${cols.join(',')}) VALUES ${tuples.join(',')}${onConflict}`;
+}
+
+/**
  * Multi-row INSERT. No RETURNING.
  *
  * @param conflictTarget  When set, appends ON CONFLICT (<target>) DO NOTHING.
@@ -99,20 +124,30 @@ export async function upsertRows<T = Record<string, unknown>>(opts: {
  *   which is not rows.length when a conflict is skipped -- callers that report
  *   persistence counts must use the return value, or a silently dropped row
  *   reads as a written one.
+ * @param conflictWhere  The arbiter index's PREDICATE, required when that index
+ *   is PARTIAL. Postgres infers the arbiter index from the conflict target, and
+ *   a partial index is only inferable when the statement repeats its WHERE
+ *   clause: a bare ON CONFLICT (cols) against a partial index fails at PLAN
+ *   time with 42P10 "there is no unique or exclusion constraint matching the
+ *   ON CONFLICT specification" -- which is how run #37 wrote 0 rows. Passing
+ *   the predicate emits ON CONFLICT (cols) WHERE <pred> DO NOTHING, and the
+ *   plan then names the index under "Conflict Arbiter Indexes".
+ *
+ *   Its own parameter rather than text appended to conflictTarget: the two are
+ *   the distinct halves of Postgres's conflict_target (index column list, then
+ *   index_predicate), and this helper owns the parentheses. A caller that had
+ *   to smuggle a closing paren into a "target" string would be hand-writing SQL
+ *   syntax at every call site.
  */
 export async function insertRows(
-  table: string, cols: string[], rows: unknown[][], conflictTarget?: string,
+  table: string, cols: string[], rows: unknown[][],
+  conflictTarget?: string, conflictWhere?: string,
 ): Promise<number> {
   if (rows.length === 0) return 0;
-  const width = cols.length;
   const values: unknown[] = [];
-  const tuples = rows.map((row, r) => {
-    values.push(...row);
-    return `(${row.map((_, c) => `$${r * width + c + 1}`).join(',')})`;
-  });
-  const onConflict = conflictTarget ? ` ON CONFLICT (${conflictTarget}) DO NOTHING` : '';
-  const res = await ingestPool().query(
-    `INSERT INTO ${table} (${cols.join(',')}) VALUES ${tuples.join(',')}${onConflict}`, values);
+  for (const row of rows) values.push(...row);
+  const sql = buildInsertSql(table, cols, rows.length, conflictTarget, conflictWhere);
+  const res = await ingestPool().query(sql, values);
   return res.rowCount ?? 0;
 }
 
