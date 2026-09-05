@@ -1,0 +1,106 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Broadcast Quiz Card — Cat
+#
+# Three trivia cards a day to wwwsnowbunnymafiacom. Question and four lettered
+# options on the card; THE ANSWER IS NEVER POSTED — it is revealed by hand in
+# the comments. The worker does not even read correct_answer.
+#
+# SAME WORKER AS THE GTA POOL, different QUIZ_CATEGORY. The only differences
+# between the two pipelines are the category string, the account and the
+# schedule, so they share workers/broadcast-quiz-card.ts rather than forking a
+# near-identical file that would drift.
+#
+# ACCOUNT: wwwsnowbunnymafiacom. Confirmed with the account owner 2026-09-05
+# before wiring — both candidate accounts had zero posting history and Blotato
+# exposes no display name or bio, so this could not be inferred from any
+# system. It was asked.
+#
+# CADENCE: 13:30 / 18:30 / 23:30 UTC. Every existing cron sits on the hour or
+# at :15/:30/:45 in the 03:00-08:00 ingest band, plus 10:00, 12:00, 14:00 and
+# 19:00; these three land in otherwise empty hours and are offset two hours
+# from the GTA pool's slots so the two accounts never publish together.
+#
+# THE SCHEDULE IS NOT WHAT KEEPS THEM APART. GitHub's dispatch on this repo
+# drifts by hours. Separation is enforced in the data: each run counts today's
+# posts for ITS account and stands down on its own rules. The times below space
+# the feed, they are not a correctness mechanism.
+#
+# CAP: 3 posts per account per UTC day, checked before anything renders.
+# Hitting it EXITS 0 — a cap doing its job is not a failure.
+#
+# POOL DEPTH: 20 questions at 3/day = under 7 days before the rotation loops.
+# The shallowest pool in the system — worth more questions before this runs
+# unattended for long.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. Status codes and named fields
+# only — and never the answer key, since these logs would otherwise be the
+# game's own spoiler surface.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this holds
+# a database credential, a publishing API key and the app's owner secret.
+#
+# Required repo secrets (the same four every broadcast workflow uses):
+#   AIVE_INGEST_DATABASE_URL   scoped aive_ingest role (SELECT/UPDATE on
+#                              quiz_questions, SELECT on the job tables)
+#   BLOTATO_API_KEY            card rendering
+#   AIVE_CRON_SECRET           Bearer for the app's requireOwnerAuth
+#   AIVE_BASE_URL              deployed app origin (a SECRET, not a variable)
+# ═══════════════════════════════════════════════════════════════════════════
+name: Broadcast Quiz Card (Cat)
+
+on:
+  schedule:
+    - cron: '30 13 * * *'
+    - cron: '30 18 * * *'
+    - cron: '30 23 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Render and report without publishing (1 = dry run)'
+        required: false
+        default: ''
+      skip_today:
+        description: 'Skip this run without consuming a question (1 = skip)'
+        required: false
+        default: ''
+      force_qid:
+        description: 'Exact quiz_questions.id to post instead of the rotation'
+        required: false
+        default: ''
+
+concurrency:
+  group: broadcast-quiz-cat
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    # Text rendering finished on the first 5s poll when measured. 15 minutes is
+    # far more than needed and still cannot leave a half-finished publish:
+    # staging and dispatch are single calls after the render.
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Render and post Cat quiz card
+        env:
+          QUIZ_CATEGORY: CAT
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          BLOTATO_API_KEY: ${{ secrets.BLOTATO_API_KEY }}
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          BROADCAST_DRY_RUN: ${{ inputs.dry_run }}
+          BROADCAST_SKIP_TODAY: ${{ inputs.skip_today }}
+          BROADCAST_FORCE_QID: ${{ inputs.force_qid }}
+        run: npx tsx workers/broadcast-quiz-card.ts
