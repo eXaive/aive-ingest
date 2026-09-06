@@ -46,6 +46,7 @@
  */
 
 import { q, endIngestPool } from '../lib/ingest/db';
+import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 
 /* mister.mcp.a2a — broadcast_accounts.id. The OTHER TWO CONNECTED ACCOUNTS
    (vice.marshal.kyli, wwwsnowbunnymafiacom) ARE OUT OF SCOPE for this
@@ -347,6 +348,18 @@ async function main(): Promise<void> {
     // Loud, and the topic stays pending so tomorrow retries it.
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
+
+  /* ACCEPTED IS NOT PUBLISHED -- see lib/broadcast/publishConfirm.ts. Confirm
+     the video is actually live before marking the topic used and clearing
+     pregenerated_media_url; a throw here leaves BOTH intact so tomorrow
+     retries the same topic with the same pre-rendered video. */
+  const submissionId = submissionIdFor(dispatched, MISTER_MCP_A2A);
+  if (!submissionId) {
+    throw new Error('dispatch reported posted but carried no submission id — cannot confirm the post went live');
+  }
+  const confirmed = await confirmPublished(
+    submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[broadcast-daily] ${m}`));
+  console.log(`[broadcast-daily] publish confirmed${confirmed.publicUrl ? ` — ${confirmed.publicUrl}` : ''}`);
 
   // Clearing pregenerated_media_url here, in the same statement, is what makes
   // it single-use. Doing it separately would leave a window where a crash
