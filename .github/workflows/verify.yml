@@ -1,0 +1,84 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Verify — typecheck plus every scripts/verify-*.ts contract, on push and PR.
+#
+# WHY THIS DID NOT EXIST UNTIL NOW, AND WHY IT DOES.
+# This repo had twelve verify scripts and NOTHING that ran them. They were
+# manual-only, so "the suite is green" only ever meant "nobody ran it". The
+# ON CONFLICT partial-index defect shipped to production TWICE that way: the
+# emitted SQL was wrong, run #38 wrote 0 rows across 32 chunks, and no check
+# anywhere objected.
+#
+# Adding verify-insert-conflict-sql.ts without this workflow would have
+# repeated the mistake at one remove -- a test that catches the bug, that
+# nothing runs.
+#
+# EVERY SCRIPT HERE IS OFFLINE. No secrets are referenced and none are
+# needed: the verify scripts assert source text, pure functions and emitted
+# SQL. That is what makes it safe to run on pull_request from a public repo --
+# a fork's PR gets no credentials because there are none to get.
+#
+# The data workflows in this repo are unaffected; they run on their own crons
+# and hold their own secrets.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # Supersede an in-flight run when a branch is pushed again; these checks are
+  # pure and re-runnable, so the newest commit is the only one worth reporting.
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # The whole suite runs in well under a minute; 10 is a stuck-process bound,
+    # not an expectation.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Listed individually rather than globbed so a script that is ADDED but
+      # never registered in package.json cannot pass by silently not running.
+      - name: verify:insert-conflict-sql
+        run: npm run verify:insert-conflict-sql
+      - name: verify:probe-run-evidence
+        run: npm run verify:probe-run-evidence
+      - name: verify:mcp-registry-outcome
+        run: npm run verify:mcp-registry-outcome
+      - name: verify:registry-retry
+        run: npm run verify:registry-retry
+      - name: verify:tool-collection-evidence
+        run: npm run verify:tool-collection-evidence
+      - name: verify:list-collectors
+        run: npm run verify:list-collectors
+      - name: verify:tools-collector
+        run: npm run verify:tools-collector
+      - name: verify:exclusions
+        run: npm run verify:exclusions
+      - name: verify:throw-isolation
+        run: npm run verify:throw-isolation
+      - name: verify:write-access
+        run: npm run verify:write-access
+      - name: verify:rejection-parsing
+        run: npm run verify:rejection-parsing
+      - name: verify:host-backoff
+        run: npm run verify:host-backoff
