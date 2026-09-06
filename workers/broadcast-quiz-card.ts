@@ -37,6 +37,7 @@
  */
 
 import { q, endIngestPool } from '../lib/ingest/db';
+import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 
 /* Confirmed with the account owner 2026-09-05 before wiring. Both accounts had
    zero posting history and Blotato exposes no display name or bio, so nothing
@@ -383,7 +384,20 @@ async function main(): Promise<void> {
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
 
-  /* Marked ONLY after a confirmed post, both columns in one statement.
+  /* ACCEPTED IS NOT PUBLISHED. status='posted' means Blotato took the post,
+     not that it went live -- publishing is asynchronous and took about a
+     minute when measured. Confirm the live state before recording that this
+     question was consumed; anything other than `published` throws, leaving the
+     rotation untouched so the next slot retries it. */
+  const submissionId = submissionIdFor(dispatched, pool.accountId);
+  if (!submissionId) {
+    throw new Error('dispatch reported posted but carried no submission id — cannot confirm the post went live');
+  }
+  const confirmed = await confirmPublished(
+    submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[quiz-card] ${m}`));
+  console.log(`[quiz-card] publish confirmed${confirmed.publicUrl ? ` — ${confirmed.publicUrl}` : ''}`);
+
+  /* Marked ONLY after a CONFIRMED PUBLISH, both columns in one statement.
      quiz_posted_at is what the per-day attribution counts, so writing it
      separately would leave a window where a crash lets an extra card out. */
   await q(

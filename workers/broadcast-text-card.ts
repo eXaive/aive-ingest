@@ -38,6 +38,7 @@
  */
 
 import { q, endIngestPool } from '../lib/ingest/db';
+import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 
 /* mister.mcp.a2a. The other two connected accounts (vice.marshal.kyli,
    wwwsnowbunnymafiacom) are out of scope and must never appear here. */
@@ -372,7 +373,17 @@ async function main(): Promise<void> {
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
 
-  /* Marked ONLY after a confirmed post, both columns in one statement.
+  /* ACCEPTED IS NOT PUBLISHED -- see lib/broadcast/publishConfirm.ts. Confirm
+     the post is actually live before recording the topic as consumed. */
+  const submissionId = submissionIdFor(dispatched, MISTER_MCP_A2A);
+  if (!submissionId) {
+    throw new Error('dispatch reported posted but carried no submission id — cannot confirm the post went live');
+  }
+  const confirmed = await confirmPublished(
+    submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[broadcast-card] ${m}`));
+  console.log(`[broadcast-card] publish confirmed${confirmed.publicUrl ? ` — ${confirmed.publicUrl}` : ''}`);
+
+  /* Marked ONLY after a CONFIRMED PUBLISH, both columns in one statement.
      card_posted_at is what the per-day cap counts, so writing it separately
      would leave a window where a crash lets an extra card through. */
   await q(
