@@ -511,7 +511,7 @@ export async function probeMcpEndpoints(
         r.probe_method, r.content_type,
         r.response_headers ? JSON.stringify(r.response_headers) : null,
         probeRunId, 'REACHABILITY',
-      ]), 'probe_run_id, server_id, endpoint_url, observation_kind');
+      ]), 'probe_run_id, server_id, endpoint_url, observation_kind', 'probe_run_id IS NOT NULL');
       /* Count what LANDED, not what was sent. DO NOTHING makes those differ,
          and persisted feeds the COMPLETE/PARTIAL run state -- crediting a
          skipped row would report a lossy run as complete.

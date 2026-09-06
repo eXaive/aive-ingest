@@ -101,7 +101,8 @@ export async function upsertRows<T = Record<string, unknown>>(opts: {
  *   reads as a written one.
  */
 export async function insertRows(
-  table: string, cols: string[], rows: unknown[][], conflictTarget?: string,
+  table: string, cols: string[], rows: unknown[][],
+  conflictTarget?: string, conflictWhere?: string,
 ): Promise<number> {
   if (rows.length === 0) return 0;
   const width = cols.length;
@@ -110,7 +111,9 @@ export async function insertRows(
     values.push(...row);
     return `(${row.map((_, c) => `$${r * width + c + 1}`).join(',')})`;
   });
-  const onConflict = conflictTarget ? ` ON CONFLICT (${conflictTarget}) DO NOTHING` : '';
+  const onConflict = conflictTarget
+    ? ` ON CONFLICT (${conflictTarget})${conflictWhere ? ` WHERE ${conflictWhere}` : ''} DO NOTHING`
+    : '';
   const res = await ingestPool().query(
     `INSERT INTO ${table} (${cols.join(',')}) VALUES ${tuples.join(',')}${onConflict}`, values);
   return res.rowCount ?? 0;
