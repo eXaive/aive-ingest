@@ -29,6 +29,7 @@
     "watchdog": "tsx workers/ingest-watchdog.ts",
     "broadcast:text-card": "tsx workers/broadcast-text-card.ts",
     "broadcast:quiz-card": "tsx workers/broadcast-quiz-card.ts",
+    "broadcast:reconcile": "tsx workers/reconcile-broadcast-publications.ts",
     "verify:insert-conflict-sql": "tsx scripts/verify-insert-conflict-sql.ts"
   },
   "dependencies": {

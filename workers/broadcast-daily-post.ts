@@ -47,6 +47,7 @@
 
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
+import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
 
 /* mister.mcp.a2a — broadcast_accounts.id. The OTHER TWO CONNECTED ACCOUNTS
    (vice.marshal.kyli, wwwsnowbunnymafiacom) ARE OUT OF SCOPE for this
@@ -168,12 +169,15 @@ const MAX_POSTS_PER_DAY = 3;
  */
 async function standDownReason(): Promise<string | null> {
   const [jobs] = await q<{ n: string }>(
-    `SELECT count(*)::text AS n
-       FROM broadcast_job_accounts ja
-       JOIN broadcast_jobs j ON j.id = ja.job_id
-      WHERE ja.account_id = $1
-        AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
-        AND j.status IN ('posted', 'pending_api')`,
+    `SELECT count(*)::text AS n FROM (
+       SELECT 'job:' || j.id::text AS capacity_key FROM broadcast_job_accounts ja
+       JOIN broadcast_jobs j ON j.id = ja.job_id WHERE ja.account_id = $1
+       AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AND j.status IN ('posted','pending_api')
+       UNION SELECT 'attempt:' || a.id::text FROM broadcast_publication_attempts a
+       WHERE a.account_id = $1 AND ((a.capacity_day = (now() AT TIME ZONE 'UTC')::date
+       AND a.state IN ('reserved','confirmed_published')) OR a.state IN ('submitting','provider_accepted','confirmation_pending','outcome_unknown'))
+       AND NOT EXISTS (SELECT 1 FROM broadcast_jobs j WHERE j.id=a.job_id AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AND j.status IN ('posted','pending_api'))
+     ) capacity`,
     [MISTER_MCP_A2A],
   );
   const [queue] = await q<{ videos: string; cards: string }>(
@@ -301,6 +305,20 @@ async function main(): Promise<void> {
   const forced = process.env.BROADCAST_FORCE_TOPIC?.trim() || null;
   const topic = await nextTopic(forced);
   if (!topic) throw new Error(forced ? `forced topic not found: ${forced}` : 'no topic available');
+  const slotKey = await nextPublicationSlot('broadcast_topic', topic.id, 'daily-video');
+  const leaseOwner = crypto.randomUUID();
+  const intentKey = `topic-video:${topic.id}:${slotKey}`;
+  const attempt = await claimPublication({ intentKey, sourceKind: 'broadcast_topic', sourceId: topic.id, purpose: 'daily-video', slotKey, accountId: MISTER_MCP_A2A, leaseOwner, dailyCap: MAX_POSTS_PER_DAY });
+  if (!attempt) throw new Error('publication capacity reservation was refused');
+  if (attempt.state === 'confirmed_published') {
+    await q(`UPDATE broadcast_topic_queue SET status = 'used', used_at = coalesce(used_at, now()), pregenerated_media_url = NULL WHERE id = $1`, [topic.id]);
+    console.log(`[broadcast-daily] recovered confirmed publication for topic=${topic.topic_name}; no render or submission`);
+    return;
+  }
+  if (attempt.state !== 'reserved' || attempt.lease_owner !== leaseOwner) {
+    console.log(`[broadcast-daily] existing attempt state=${attempt.state}; no render or provider submission`);
+    return;
+  }
   console.log(`[broadcast-daily] topic=${topic.topic_name} layer=${topic.layer} evidence=${topic.evidence_status}${forced ? ' (forced)' : ''}`);
 
   /* A topic can carry an already-rendered video, in which case generation is
@@ -325,6 +343,7 @@ async function main(): Promise<void> {
     caption,
     platform_targets: ['tiktok'],
     accounts: [{ account_id: MISTER_MCP_A2A }],
+    publication_intent: { key: intentKey, source_kind: 'broadcast_topic', source_id: topic.id, purpose: 'daily-video', slot_key: slotKey, lease_owner: leaseOwner },
   });
   const jobId = staged.job?.id;
   if (!jobId) throw new Error('staging returned no job id');
@@ -345,20 +364,30 @@ async function main(): Promise<void> {
   console.log(`[broadcast-daily] dispatch status=${status} accepted=${accepted}/${total}`);
 
   if (status !== 'posted') {
-    // Loud, and the topic stays pending so tomorrow retries it.
+    // Explicit rejection may retry; ambiguous acceptance remains blocked for
+    // reconciliation and cannot create another provider submission.
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
 
   /* ACCEPTED IS NOT PUBLISHED -- see lib/broadcast/publishConfirm.ts. Confirm
      the video is actually live before marking the topic used and clearing
      pregenerated_media_url; a throw here leaves BOTH intact so tomorrow
-     retries the same topic with the same pre-rendered video. */
+     retains the same provider submission id for GET-only reconciliation. */
   const submissionId = submissionIdFor(dispatched, MISTER_MCP_A2A);
   if (!submissionId) {
     throw new Error('dispatch reported posted but carried no submission id — cannot confirm the post went live');
   }
-  const confirmed = await confirmPublished(
-    submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[broadcast-daily] ${m}`));
+  await markConfirmationPending(attempt.id, submissionId, jobId);
+  let confirmed;
+  try {
+    confirmed = await confirmPublished(
+      submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[broadcast-daily] ${m}`));
+    await markConfirmed(attempt.id, confirmed.publicUrl);
+  } catch (error: any) {
+    if (error?.terminal) await markConfirmationFailed(attempt.id, error?.message ?? 'provider reported terminal failure');
+    else await touchConfirmationPending(attempt.id, error?.message ?? 'confirmation remains pending');
+    throw error;
+  }
   console.log(`[broadcast-daily] publish confirmed${confirmed.publicUrl ? ` — ${confirmed.publicUrl}` : ''}`);
 
   // Clearing pregenerated_media_url here, in the same statement, is what makes

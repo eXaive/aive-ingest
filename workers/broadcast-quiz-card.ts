@@ -38,6 +38,7 @@
 
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
+import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
 
 /* Confirmed with the account owner 2026-09-05 before wiring. Both accounts had
    zero posting history and Blotato exposes no display name or bio, so nothing
@@ -168,12 +169,15 @@ async function nextQuestion(category: QuizCategory, forceId: string | null): Pro
  */
 async function postCountsToday(accountId: string, category: QuizCategory): Promise<{ jobs: number; cards: number }> {
   const [jobs] = await q<{ n: string }>(
-    `SELECT count(*)::text AS n
-       FROM broadcast_job_accounts ja
-       JOIN broadcast_jobs j ON j.id = ja.job_id
-      WHERE ja.account_id = $1
-        AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
-        AND j.status IN ('posted', 'pending_api')`,
+    `SELECT count(*)::text AS n FROM (
+       SELECT 'job:' || j.id::text AS capacity_key FROM broadcast_job_accounts ja
+       JOIN broadcast_jobs j ON j.id = ja.job_id WHERE ja.account_id = $1
+       AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AND j.status IN ('posted','pending_api')
+       UNION SELECT 'attempt:' || a.id::text FROM broadcast_publication_attempts a
+       WHERE a.account_id = $1 AND ((a.capacity_day = (now() AT TIME ZONE 'UTC')::date
+       AND a.state IN ('reserved','confirmed_published')) OR a.state IN ('submitting','provider_accepted','confirmation_pending','outcome_unknown'))
+       AND NOT EXISTS (SELECT 1 FROM broadcast_jobs j WHERE j.id=a.job_id AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AND j.status IN ('posted','pending_api'))
+     ) capacity`,
     [accountId],
   );
   const [cards] = await q<{ n: string }>(
@@ -331,6 +335,23 @@ async function main(): Promise<void> {
   const row = await nextQuestion(category, forceId);
   if (!row) throw new Error(forceId ? `forced question not found in ${category}: ${forceId}` : `no ${category} question available`);
 
+  const slotKey = await nextPublicationSlot('quiz_question', row.id, 'quiz-card');
+  const leaseOwner = crypto.randomUUID();
+  const intentKey = `quiz-card:${category}:${row.id}:${slotKey}`;
+  const attempt = dryRun
+    ? { id: '', state: 'reserved' as const, lease_owner: leaseOwner }
+    : await claimPublication({ intentKey, sourceKind: 'quiz_question', sourceId: row.id, purpose: 'quiz-card', slotKey, accountId: pool.accountId, leaseOwner, dailyCap: MAX_POSTS_PER_DAY });
+  if (!attempt) throw new Error('publication capacity reservation was refused');
+  if (attempt.state === 'confirmed_published') {
+    await q(`UPDATE quiz_questions SET used_as_quiz_card = true, quiz_posted_at = coalesce(quiz_posted_at, now()) WHERE id = $1`, [row.id]);
+    console.log(`[quiz-card] recovered confirmed publication for question=${row.id}; no render or submission`);
+    return;
+  }
+  if (attempt.state !== 'reserved' || attempt.lease_owner !== leaseOwner) {
+    console.log(`[quiz-card] existing attempt state=${attempt.state}; no render or provider submission`);
+    return;
+  }
+
   const cardText = buildCardText(row);
   const caption = buildCaption(row, pool.hashtags);
   console.log(`[quiz-card] question=${row.id} chars=${cardText.length}${forceId ? ' (forced)' : ''}`);
@@ -355,6 +376,7 @@ async function main(): Promise<void> {
     caption,
     platform_targets: ['tiktok'],
     accounts: [{ account_id: pool.accountId }],
+    publication_intent: { key: intentKey, source_kind: 'quiz_question', source_id: row.id, purpose: 'quiz-card', slot_key: slotKey, lease_owner: leaseOwner },
   });
   const jobId = staged.job?.id;
   if (!jobId) throw new Error('staging returned no job id');
@@ -380,21 +402,31 @@ async function main(): Promise<void> {
   console.log(`[quiz-card] dispatch status=${status} accepted=${accepted}/${total}`);
 
   if (status !== 'posted') {
-    // Loud, and the rotation stays put so the next slot retries this question.
+    // The durable target attempt decides what follows: explicit rejection may
+    // retry; an ambiguous outcome remains blocked for reconciliation.
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
 
   /* ACCEPTED IS NOT PUBLISHED. status='posted' means Blotato took the post,
      not that it went live -- publishing is asynchronous and took about a
      minute when measured. Confirm the live state before recording that this
-     question was consumed; anything other than `published` throws, leaving the
-     rotation untouched so the next slot retries it. */
+     question was consumed. A timeout leaves the same submission id pending for
+     GET-only reconciliation; it is never converted into a new submission. */
   const submissionId = submissionIdFor(dispatched, pool.accountId);
   if (!submissionId) {
     throw new Error('dispatch reported posted but carried no submission id — cannot confirm the post went live');
   }
-  const confirmed = await confirmPublished(
-    submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[quiz-card] ${m}`));
+  await markConfirmationPending(attempt.id, submissionId, jobId);
+  let confirmed;
+  try {
+    confirmed = await confirmPublished(
+      submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[quiz-card] ${m}`));
+    await markConfirmed(attempt.id, confirmed.publicUrl);
+  } catch (error: any) {
+    if (error?.terminal) await markConfirmationFailed(attempt.id, error?.message ?? 'provider reported terminal failure');
+    else await touchConfirmationPending(attempt.id, error?.message ?? 'confirmation remains pending');
+    throw error;
+  }
   console.log(`[quiz-card] publish confirmed${confirmed.publicUrl ? ` — ${confirmed.publicUrl}` : ''}`);
 
   /* Marked ONLY after a CONFIRMED PUBLISH, both columns in one statement.

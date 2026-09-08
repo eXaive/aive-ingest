@@ -39,6 +39,7 @@
 
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
+import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
 
 /* mister.mcp.a2a. The other two connected accounts (vice.marshal.kyli,
    wwwsnowbunnymafiacom) are out of scope and must never appear here. */
@@ -144,12 +145,15 @@ async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
  */
 async function postingCountsToday(): Promise<{ total: number; cards: number; videos: number }> {
   const [jobs] = await q<{ n: string }>(
-    `SELECT count(*)::text AS n
-       FROM broadcast_job_accounts ja
-       JOIN broadcast_jobs j ON j.id = ja.job_id
-      WHERE ja.account_id = $1
-        AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
-        AND j.status IN ('posted', 'pending_api')`,
+    `SELECT count(*)::text AS n FROM (
+       SELECT 'job:' || j.id::text AS capacity_key FROM broadcast_job_accounts ja
+       JOIN broadcast_jobs j ON j.id = ja.job_id WHERE ja.account_id = $1
+       AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AND j.status IN ('posted','pending_api')
+       UNION SELECT 'attempt:' || a.id::text FROM broadcast_publication_attempts a
+       WHERE a.account_id = $1 AND ((a.capacity_day = (now() AT TIME ZONE 'UTC')::date
+       AND a.state IN ('reserved','confirmed_published')) OR a.state IN ('submitting','provider_accepted','confirmation_pending','outcome_unknown'))
+       AND NOT EXISTS (SELECT 1 FROM broadcast_jobs j WHERE j.id=a.job_id AND j.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AND j.status IN ('posted','pending_api'))
+     ) capacity`,
     [MISTER_MCP_A2A],
   );
   const [queue] = await q<{ cards: string; videos: string }>(
@@ -322,6 +326,21 @@ async function main(): Promise<void> {
   const topic = await nextTopic(forced);
   if (!topic) throw new Error(forced ? `forced topic not found or skipped: ${forced}` : 'no topic available for a card');
 
+  const slotKey = await nextPublicationSlot('broadcast_topic', topic.id, 'text-card');
+  const leaseOwner = crypto.randomUUID();
+  const intentKey = `topic-text-card:${topic.id}:${slotKey}`;
+  const attempt = await claimPublication({ intentKey, sourceKind: 'broadcast_topic', sourceId: topic.id, purpose: 'text-card', slotKey, accountId: MISTER_MCP_A2A, leaseOwner, dailyCap: MAX_POSTS_PER_DAY });
+  if (!attempt) throw new Error('publication capacity reservation was refused');
+  if (attempt.state === 'confirmed_published') {
+    await q(`UPDATE broadcast_topic_queue SET used_as_card = true, card_posted_at = coalesce(card_posted_at, now()) WHERE id = $1`, [topic.id]);
+    console.log(`[broadcast-card] recovered confirmed publication for topic=${topic.topic_name}; no render or submission`);
+    return;
+  }
+  if (attempt.state !== 'reserved' || attempt.lease_owner !== leaseOwner) {
+    console.log(`[broadcast-card] existing attempt state=${attempt.state}; no render or provider submission`);
+    return;
+  }
+
   const cardText = buildCardText(topic);
   console.log(
     `[broadcast-card] format=text-card topic=${topic.topic_name} layer=${topic.layer} ` +
@@ -342,6 +361,7 @@ async function main(): Promise<void> {
     caption,
     platform_targets: ['tiktok'],
     accounts: [{ account_id: MISTER_MCP_A2A }],
+    publication_intent: { key: intentKey, source_kind: 'broadcast_topic', source_id: topic.id, purpose: 'text-card', slot_key: slotKey, lease_owner: leaseOwner },
   });
   const jobId = staged.job?.id;
   if (!jobId) throw new Error('staging returned no job id');
@@ -369,7 +389,8 @@ async function main(): Promise<void> {
   console.log(`[broadcast-card] dispatch status=${status} accepted=${accepted}/${total}`);
 
   if (status !== 'posted') {
-    // Loud, and the rotation stays put so the next slot retries this topic.
+    // Explicit rejection may retry; ambiguous acceptance remains blocked for
+    // reconciliation and cannot create another provider submission.
     throw new Error(`dispatch did not post (status=${status}, accepted=${accepted}/${total})`);
   }
 
@@ -379,8 +400,17 @@ async function main(): Promise<void> {
   if (!submissionId) {
     throw new Error('dispatch reported posted but carried no submission id — cannot confirm the post went live');
   }
-  const confirmed = await confirmPublished(
-    submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[broadcast-card] ${m}`));
+  await markConfirmationPending(attempt.id, submissionId, jobId);
+  let confirmed;
+  try {
+    confirmed = await confirmPublished(
+      submissionId, requireEnv('BLOTATO_API_KEY'), (m) => console.log(`[broadcast-card] ${m}`));
+    await markConfirmed(attempt.id, confirmed.publicUrl);
+  } catch (error: any) {
+    if (error?.terminal) await markConfirmationFailed(attempt.id, error?.message ?? 'provider reported terminal failure');
+    else await touchConfirmationPending(attempt.id, error?.message ?? 'confirmation remains pending');
+    throw error;
+  }
   console.log(`[broadcast-card] publish confirmed${confirmed.publicUrl ? ` — ${confirmed.publicUrl}` : ''}`);
 
   /* Marked ONLY after a CONFIRMED PUBLISH, both columns in one statement.

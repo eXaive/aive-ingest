@@ -78,7 +78,7 @@ export function submissionIdFor(
 
 /** Raised when a submission reaches a terminal state that is not `published`. */
 export class PublishNotConfirmed extends Error {
-  constructor(message: string) {
+  constructor(message: string, public readonly terminal = false) {
     super(message);
     this.name = 'PublishNotConfirmed';
   }
@@ -136,7 +136,7 @@ export async function confirmPublished(
     if (lastStatus === 'failed') {
       const detail = typeof parsed.errorMessage === 'string'
         ? parsed.errorMessage.slice(0, 200) : '(no errorMessage)';
-      throw new PublishNotConfirmed(`Blotato reported the post FAILED after accepting it: ${detail}`);
+      throw new PublishNotConfirmed(`Blotato reported the post FAILED after accepting it: ${detail}`, true);
     }
     if (lastStatus === 'scheduled') {
       throw new PublishNotConfirmed(
