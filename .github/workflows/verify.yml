@@ -66,6 +66,8 @@ jobs:
         run: npm run verify:mcp-registry-outcome
       - name: verify:registry-retry
         run: npm run verify:registry-retry
+      - name: verify:registry-checkpoint
+        run: npm run verify:registry-checkpoint
       - name: verify:tool-collection-evidence
         run: npm run verify:tool-collection-evidence
       - name: verify:list-collectors

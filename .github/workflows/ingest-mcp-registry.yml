@@ -1,16 +1,24 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# MCP Registry Ingest — daily full scan of registry.modelcontextprotocol.io
+# MCP Registry Ingest — daily checkpointed read of registry.modelcontextprotocol.io
 #
 # Moved here from the private repo 2026-08-01; cadence unchanged (05:00 UTC).
-# Runs the worker directly on the runner and exits non-zero on any ingest
-# error or a stale mcp_server_snapshots stream (in-worker freshness tripwire,
-# MCP_FRESHNESS_HOURS default 48). The red Actions run IS the alert.
+# Since 2026-09-15 each run is one phase of a checkpointed walk, with its state
+# in ingest_checkpoints: a resumable backfill under a 20-minute budget until the
+# one-time full pass completes, then daily ?updated_since deltas. The full walk
+# had outgrown this job — run 34832547013 was killed by timeout-minutes on
+# page 700 with nothing written. A budget stop is a committed checkpoint and
+# exits 0. The run exits non-zero when nothing usable landed or the
+# mcp_server_snapshots stream is stale (in-worker freshness tripwire,
+# MCP_FRESHNESS_HOURS default 26). The red Actions run IS the alert.
+#
+# timeout-minutes stays 30: the walk budget is 20, leaving room for the final
+# commit, the cache refresh and the tripwire.
 #
 # Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
 # workflow holds a database credential and must not be reachable from forks.
 #
 # Required repo secret: AIVE_INGEST_DATABASE_URL (scoped aive_ingest role —
-# six tables, no delete). Nothing else.
+# no delete anywhere). Nothing else.
 # ═══════════════════════════════════════════════════════════════════════════
 name: MCP Registry Ingest
 

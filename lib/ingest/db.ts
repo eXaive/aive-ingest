@@ -4,9 +4,9 @@
  * ingest-npm-sdk-packages, ingest-webhook-providers).
  *
  * Direct Postgres via the scoped `aive_ingest` role — NOT supabase-js, NOT
- * PostgREST, NOT the service-role key. The role's entire surface is six
- * tables (registry_artifacts, registry_artifact_snapshots, scan_runs,
- * mcp_servers, mcp_server_snapshots, ingestion_log) with no DELETE anywhere;
+ * PostgREST, NOT the service-role key. The ingest tables are registry_artifacts,
+ * registry_artifact_snapshots, scan_runs, mcp_servers, mcp_server_snapshots,
+ * ingestion_log and ingest_checkpoints (2026-09-15), with no DELETE anywhere;
  * a leaked AIVE_INGEST_DATABASE_URL can vandalize re-ingestable public data,
  * not read PII or destroy anything.
  *
