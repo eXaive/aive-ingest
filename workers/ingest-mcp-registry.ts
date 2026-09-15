@@ -1,37 +1,57 @@
 /**
  * MCP Registry Ingest Worker
  *
- * Pages GET https://registry.modelcontextprotocol.io/v0.1/servers in two
- * CHECKPOINTED phases (2026-09-15) that share one row of ingest_checkpoints
- * (source = 'mcp-registry'):
+ * Pages GET https://registry.modelcontextprotocol.io/v0.1/servers in a
+ * CHECKPOINTED daily FULL walk (2026-09-15, revised 2026-09-16) backed by one
+ * row of ingest_checkpoints (source = 'mcp-registry'):
  *
- *   backfill — the one-time full walk. Resumes from the saved cursor and runs
- *     until a WALK_BUDGET_MS wall-clock budget or the end of the corpus,
- *     committing every SEGMENT_PAGES pages: rows first, then the cursor, then
- *     an ingestion_log row. A budget stop is a committed checkpoint and exits
- *     0; the next run resumes from the cursor, not the first page. Reaching the
- *     end of the corpus flips the phase to delta and stamps last_full_pass_at.
+ *   backfill — the steady state, every day. Resumes from the saved cursor
+ *     (null = start of corpus) and runs until a WALK_BUDGET_MS wall-clock
+ *     budget or the end of the corpus, committing every SEGMENT_PAGES pages:
+ *     rows first, then the cursor, then an ingestion_log row. A budget stop
+ *     is a committed checkpoint and exits 0; the next run — later the same
+ *     day, or tomorrow's cron — resumes from the cursor, not the first page.
+ *     Reaching the end of the corpus RE-ARMS for another full walk: cursor
+ *     clears to null, phase stays 'backfill', and tomorrow's run starts a
+ *     fresh full pass rather than switching to reading changes only.
  *   delta — GET ?updated_since=<watermark> (the registry turns include_deleted
  *     on with updated_since; it is set explicitly too), paged and upserted
- *     idempotently. On completion the watermark moves to run start minus
- *     DELTA_LOOKBACK_MS: the registry sorts no secondary key, so a change
- *     stamped on the boundary is re-read rather than risked, and the upsert
- *     makes re-reading harmless.
+ *     idempotently, watermark advancing to run start minus DELTA_LOOKBACK_MS
+ *     on completion. NOT the steady state (reverted 2026-09-16 — see below).
+ *     Kept fully working as something an operator can hand-flip a checkpoint
+ *     row into (to exercise the path, or if a real need for it returns), and
+ *     as the target of the oversized-changeset fallback below, but nothing in
+ *     normal daily operation enters it.
  *
- * WHY (run 34832547013, 2026-09-14). The daily full walk had grown to 700+
- * pages (~70k entries) while the registry slowed to ~2-4.5 s/page. It crossed
- * the workflow's timeout-minutes: 30 and was killed at elapsed_s≈1801 on page
- * 700. Every fetched page was held in memory until the end, so the kill
- * committed nothing — no rows, no scan_runs close, no ingestion_log row — and
- * the watchdog read 31.6h since the last run. Registry metadata is immutable
- * except the status field, so after one full pass only changes need reading.
+ * WHY CHECKPOINTED (run 34832547013, 2026-09-14). The daily full walk had
+ * grown to 700+ pages (~70k entries) while the registry slowed to ~2-4.5 s/
+ * page. It crossed the workflow's timeout-minutes: 30 and was killed at
+ * elapsed_s≈1801 on page 700. Every fetched page was held in memory until the
+ * end, so the kill committed nothing — no rows, no scan_runs close, no
+ * ingestion_log row — and the watchdog read 31.6h since the last run.
  *
- * WHAT last_seen MEANS NOW. From 2026-07-23 every run swept the whole
- * registry, so last_seen meant "still listed today" for every server. Delta
- * runs return only servers that changed, so last_seen is now "last appeared in
- * a read" (the backfill, or a change). Deletions are not lost: they arrive as a
- * status transition (include_deleted), are captured by the status_hash
- * comparison, and are counted in the run's status_transitions.
+ * WHY FULL WALKS STAY THE STEADY STATE, NOT DELTA (reverted 2026-09-16). The
+ * 2026-09-15 pass auto-flipped phase to 'delta' once a backfill reached the
+ * end of the corpus, reasoning that registry metadata is immutable except
+ * status, so only changes need reading after one full pass. True of the
+ * registry's data — but it silently changed what mcp_servers.last_seen means:
+ * from "every server, confirmed listed today" (a full walk touches every row)
+ * to "last appeared in a read" (a delta only touches what changed), a real
+ * change load-bearing for several surfaces (mcp-trust's default sort, the
+ * server profile's last-seen row, the corpus hero timestamp, probe-mcp's
+ * probe-freshest-first ordering) that was never a deliberate decision. The
+ * first full pass under the checkpoint design also completed in 14m42s
+ * against the 30-minute job (1,059 pages) — real headroom, not a near-miss —
+ * so there was no capacity reason to give up full walks yet. The corpus grew
+ * ~70k to 105,853 entries in a few weeks, so that headroom WILL erode; the
+ * duration warning below is the monitoring response to that, not a reason to
+ * switch to delta today.
+ *
+ * WHAT last_seen MEANS. Unchanged: every daily full walk reads every server,
+ * so last_seen is "confirmed alive as of this walk" for the whole corpus,
+ * every day. Deletions are not lost either way: they arrive as a status
+ * transition (include_deleted), are captured by the status_hash comparison,
+ * and are counted in the run's status_transitions.
  *
  * Actual API shape (confirmed from live registry 2026-06-15):
  *   servers[i] = {
@@ -351,6 +371,18 @@ export const WALK_BUDGET_MS = 20 * 60_000;
 export const SEGMENT_PAGES = 50;
 /** Delta watermark lookback; see the header. */
 export const DELTA_LOOKBACK_MS = 5 * 60_000;
+/** 60% of the job's timeout-minutes: 30 (ingest-mcp-registry.yml) — deliberately
+ *  NOT WALK_BUDGET_MS, which is an internal walk ceiling, not the job's own.
+ *  A run whose total duration reaches this is the early-warning signal that
+ *  corpus growth is eating the margin between a normal run (~15min today) and
+ *  the 30-minute job kill. Update this alongside timeout-minutes if that ever
+ *  changes. */
+export const DURATION_WARNING_MS = 18 * 60_000;
+/** True once total run duration reaches the warning threshold. A pure predicate
+ *  so the firing/non-firing boundary is testable without a real 18-minute run. */
+export function durationWarningFires(totalElapsedMs: number, thresholdMs: number = DURATION_WARNING_MS): boolean {
+  return totalElapsedMs >= thresholdMs;
+}
 
 export type StopReason = 'complete' | 'budget' | 'registry' | 'store';
 export type FlushKind = 'segment' | 'stop' | 'complete';
@@ -559,7 +591,7 @@ export interface Checkpoint {
   /** backfill: cursor of the next page to read (null = the first page). delta: always null. */
   cursor: string | null;
   phase: Phase;
-  /** delta: read changes since this instant. backfill: when the walk began, minus the lookback — the first delta's anchor. */
+  /** delta: read changes since this instant. backfill: refreshed on every completed pass, minus the lookback — where a manually-entered delta would anchor. */
   updated_since_watermark: string | null;
   last_full_pass_at: string | null;
 }
@@ -940,6 +972,8 @@ export interface RunOptions {
   lookbackMs?: number;
   interPageDelayMs?: number;
   refreshCaches?: () => Promise<CacheRefreshBundle>;
+  /** Test-only override for DURATION_WARNING_MS; production never sets this. */
+  durationWarningThresholdMs?: number;
 }
 
 export interface RunResult extends RegistryOutcome {
@@ -962,6 +996,8 @@ export interface RunResult extends RegistryOutcome {
   retries: number; retries_429: number; retries_5xx: number; retries_transport: number;
   ingest_elapsed_ms: number;
   total_elapsed_ms: number;
+  duration_warning: boolean;
+  duration_warning_threshold_ms: number;
 }
 
 export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResult> {
@@ -1027,9 +1063,12 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
 
       if (phaseBefore === 'backfill') {
         cp = kind === 'complete'
-          // The watermark stays where the walk began (minus the lookback), so
-          // the first delta also covers what changed while the walk ran.
-          ? { ...cp, cursor: null, phase: 'delta', last_full_pass_at: new Date().toISOString() }
+          // Re-arm for tomorrow's full walk (2026-09-16 revert): daily FULL
+          // walks are the steady state, not a one-time backfill that hands off
+          // to delta. The watermark is still refreshed to this run's anchor —
+          // stale by design otherwise — so a manually-flipped delta run (the
+          // header's "operator override" path) starts from THIS pass.
+          ? { ...cp, cursor: null, phase: 'backfill', updated_since_watermark: anchor(), last_full_pass_at: new Date().toISOString() }
           : { ...cp, cursor: resumeCursor };
         await store.saveCheckpoint(cp);
       }
@@ -1037,7 +1076,10 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       console.log(
         `[ingest-mcp-registry] checkpoint #${checkpoints} ${kind} phase=${phaseBefore} items=${committed.fetched} ` +
         `filtered=${committed.filtered} upserted=${committed.upserted} snapshots=${committed.snapshots}` +
-        (phaseBefore === 'backfill' ? ` cursor=${cp.cursor ?? (cp.phase === 'delta' ? '(end of corpus)' : '(first page)')}` : ''),
+        // cp.phase is always 'backfill' here (only a manual/operator action ever
+        // sets 'delta', and never inside this branch), so cursor=null always
+        // means "next read starts at the first page" — never "end of corpus".
+        (phaseBefore === 'backfill' ? ` cursor=${cp.cursor ?? '(first page)'}` : ''),
       );
       /* One ingestion_log row per committed batch, so the watchdog sees the
          run's progress as it lands. The batch that ends the run is logged once
@@ -1135,6 +1177,15 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
     });
 
     const totalElapsedMs = Date.now() - runStartMs;
+    const durationWarningThresholdMs = opts.durationWarningThresholdMs ?? DURATION_WARNING_MS;
+    const durationWarning = durationWarningFires(totalElapsedMs, durationWarningThresholdMs);
+    if (durationWarning) {
+      console.warn(
+        `[ingest-mcp-registry] DURATION WARNING: run took ${(totalElapsedMs / 60_000).toFixed(1)}min, past the ` +
+        `${(durationWarningThresholdMs / 60_000).toFixed(0)}min (60%) mark of the 30-minute job budget — ` +
+        'corpus growth may be eating the margin before the walk budget or the job timeout',
+      );
+    }
     /* The run's own row is the newest (started at the final batch), so the
        watchdog's newest-first failure streak sees the run's outcome, not an
        earlier checkpoint row. Item counts cover only what checkpoint rows have
@@ -1152,6 +1203,7 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
         checkpoints, pages: progress.pages, run_fetched: totals.fetched, run_upserted: totals.upserted,
         filtered: totals.filtered, snapshots: totals.snapshots, status_transitions: transitions,
         ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
+        duration_warning: durationWarning, duration_warning_threshold_ms: durationWarningThresholdMs,
         retries: progress.retries, retries_429: progress.retries429, retries_5xx: progress.retries5xx,
         retries_transport: progress.retriesTransport,
         partial_version_guard_skipped: totals.guardSkips,
@@ -1164,7 +1216,7 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       `[ingest-mcp-registry] Done — phase=${phaseBefore}->${cp.phase} stop=${walk.stop} pages=${progress.pages} ` +
       `fetched=${totals.fetched} filtered=${totals.filtered} upserted=${totals.upserted} snapshots=${totals.snapshots} ` +
       `checkpoints=${checkpoints} ingest_status=${outcome.ingest_status} overall_status=${outcome.overall_status} ` +
-      `ingest_elapsed_ms=${ingestElapsedMs} total_elapsed_ms=${totalElapsedMs} ` +
+      `ingest_elapsed_ms=${ingestElapsedMs} total_elapsed_ms=${totalElapsedMs} duration_warning=${durationWarning} ` +
       `fetch_ms=${progress.fetchMs} sleep_ms=${progress.sleepMs} backoff_ms=${progress.backoffMs}` + retryNote,
     );
 
@@ -1180,6 +1232,7 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       retries: progress.retries, retries_429: progress.retries429,
       retries_5xx: progress.retries5xx, retries_transport: progress.retriesTransport,
       ingest_elapsed_ms: ingestElapsedMs, total_elapsed_ms: totalElapsedMs,
+      duration_warning: durationWarning, duration_warning_threshold_ms: durationWarningThresholdMs,
     };
   } catch (err) {
     // Anything unanticipated (a checkpoint read or write failing): close the
@@ -1267,8 +1320,15 @@ function annotate(r: RunResult): void {
   } else if (r.stop === 'registry' && r.ingest_status !== 'FAILED') {
     console.log(`::warning title=MCP registry stopped early::Committed ${r.pages} page(s) and checkpointed. ${r.stop_detail ?? ''}`);
   }
-  if (r.phase_before === 'backfill' && r.phase_after === 'delta') {
-    console.log('::notice title=MCP registry full pass complete::The backfill reached the end of the corpus; daily runs now read changes only.');
+  if (r.phase_before === 'backfill' && r.stop === 'complete') {
+    console.log(`::notice title=MCP registry full pass complete::Walked the whole corpus this run (${r.pages} pages); re-armed for tomorrow's full walk.`);
+  }
+  if (r.duration_warning) {
+    console.log(
+      `::warning title=MCP registry run duration::Took ${(r.total_elapsed_ms / 60_000).toFixed(1)}min, past ` +
+      `${(r.duration_warning_threshold_ms / 60_000).toFixed(0)}min (60% of the 30-minute job budget). ` +
+      'Corpus growth may be eating the margin before the 20-minute walk budget or the 30-minute job timeout.',
+    );
   }
   for (const [name, status, fresh] of [
     ['dashboard', r.dashboard_refresh_status, r.dashboard_cache_fresh],
