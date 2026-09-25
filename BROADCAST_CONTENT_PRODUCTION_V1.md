@@ -1,77 +1,69 @@
-﻿# Broadcast Content Production V1: scope-only client
+# Broadcast Content Production V1: manual Still transport
 
-Candidate parity correction to checkpoint b74fda43. No live workflow or production
-is enabled. Existing workflow_dispatch still runs mocked tests only; no schedule,
-secrets or live job. CLI exits 1 / LIVE_TRANSPORT_DISABLED without network access.
+Local candidate only. No workflow has been invoked, no production request made,
+and no schedule is configured. Release and secret provisioning remain separate.
 
-## AIVE owns selection and production
+## Manual workflow
 
-AIVE owns canonical specs, deterministic sequence/spec-ID ordering, grants,
-transactional claims/fencing, paid caps, provider operations, private media,
-Still/Short binding and owner gates. Ingest sends scope, never a selected spec,
-episode, action, prompt, script or media identity. AIVE reselects at advance time;
-preflight evidence is not dispatch authority. One call advances at most one spec.
+Broadcast Content Production V1 accepts only mode (mock/live, default mock) and
+grant_id. Mock mode runs offline client/transport tests without a machine secret.
+Live mode requires a valid grant UUID and the dedicated GitHub secret
+AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET, bound only to the live execution step.
+The job retains contents:read, non-cancelling concurrency and a 10-minute timeout.
 
-## Final strict contract
+The new entry point is workers/broadcast-still-production-manual.ts. It requires
+--live plus GITHUB_ACTIONS=true, GITHUB_EVENT_NAME=workflow_dispatch and
+AIVE_PRODUCTION_MODE=live. Ordinary local execution remains disabled. These are
+accidental-execution guards, not substitutes for AIVE authentication and grants.
 
-POST /api/broadcast/content-production/worker/preflight
-POST /api/broadcast/content-production/worker/advance
+## Fixed contract
 
-HTTPS origin https://aive.global; dedicated production-machine Bearer token.
-Both operations send exactly the same shape:
+Origin is exactly https://aive.global (no alternate port, URL input or redirect).
+The client POSTs to /api/broadcast/content-production/worker/preflight, then at
+most once to /api/broadcast/content-production/worker/advance. Requests contain
+only contract=AIVE_CONTENT_PRODUCTION_CRON_V1, the fixed batch_id, grant_id and
+operational_run_id (numeric GitHub run ID:attempt). Authentication is the dedicated
+Bearer machine secret. AIVE alone selects specs and enforces paid reservations.
 
-```json
-{
-  "contract": "AIVE_CONTENT_PRODUCTION_CRON_V1",
-  "batch_id": "522f97ea-9397-4045-a810-27086b69dc9b",
-  "grant_id": "<protected existing owner-created grant UUID>",
-  "operational_run_id": "<numeric GitHub run ID>:<attempt>"
-}
-```
+Preflight must report shared coordination, enabled production, valid grant,
+eligible work and STILL_REQUIRED. Invalid/blocked preflight prevents advance.
+PRODUCED_TO_SHORT_REQUIRED with final_state SHORT_REQUIRED is live-client success;
+NO_ELIGIBLE_WORK is a successful no-op. Full-path PRODUCED_TO_OWNER_GATE remains
+recognized by the shared parser for compatibility but is not Still-only success.
+Unknown response keys, enum values, identities and mismatched success states fail
+closed. Other bounded AIVE outcomes are reported and return nonzero exit status.
 
-Batch fixes Space Explorers Club. There is no client-side Episode 014 range or
-selection field. GitHub run identity is evidence only, never paid idempotency.
+Timeouts are 15 seconds preflight and 330 seconds advance, allowing margin beyond
+AIVE's 300-second route. AbortController covers fetch and body reads. Redirects
+are rejected; no automatic retry exists. Advance timeout, reset, non-200 response
+or malformed body becomes UNKNOWN / TRANSPORT_UNCERTAIN. Never rerun an uncertain
+advance to recover a result: inspect AIVE's shared action first.
 
-Exact response keys:
-contract, batch_id, coordination, production_enabled, eligible_work, grant_valid,
-outcome, spec_id, episode, initial_state, final_state.
+Logs contain sanitized bounded outcomes/states, batch, validated spec/run IDs and
+elapsed time. They omit credentials, raw responses/errors, headers and media URLs.
 
-coordination: SHARED_TRANSACTIONAL / LOCAL / UNAVAILABLE.
-The three availability fields are booleans. outcome is null for enabled preflight,
-otherwise one of PRODUCED_TO_OWNER_GATE, NO_ELIGIBLE_WORK,
-BLOCKED_COORDINATION_NOT_SHARED, BLOCKED_GRANT, CLAIM_LOST, FAILED_DEFINITE, UNKNOWN.
-spec_id is UUID/null, episode positive integer/null. initial_state is STILL_REQUIRED,
-SHORT_REQUIRED or null. final_state additionally permits OWNER_REVIEW_REQUIRED and
-BLOCKED. Successful advance requires OWNER_REVIEW_REQUIRED and a spec identity.
-Unknown fields are rejected. AIVE's machineProductionContract.ts is the server
-schema; cross-repository mocked acceptance invokes this client against its routes.
+## Required grant and release prerequisites
 
-No advance unless preflight enables production with shared coordination, valid
-grant and eligible work. Advance response must disable further production and name
-an outcome. Never loop to another item. Preflight/advance deadlines: 15s/8m; manual
-mock workflow timeout 10m. The future transport must abort timed-out HTTP, reject
-redirects and disable retries. Uncertain/malformed advance results become UNKNOWN;
-no retry. Repeated GitHub runs do not manufacture spec/action identities.
+Use an owner-established exact one-spec/revision/hash grant containing only
+GENERATE_STILL, paid_cap=1 and a short validity window. The current preflight does
+not expose allowed_actions: the client cannot distinguish a Still-only grant from
+a broader grant that starts at STILL_REQUIRED. A broader grant could authorize
+AIVE's full path before the client rejects its final outcome. Verify grant scope
+before the future live run; no client-only claim of action restriction is made.
 
-## Credentials and release blockers
+AIVE Still-only code, hosted coordination/inspection migrations, authenticator
+membership, dedicated machine/database worker credentials, reference bundling and
+private storage must be verified during release. Nothing here deploys them or
+creates a grant/secret. No OpenAI, Blotato, owner, Supabase or database credential
+is supplied to this transport. Windows/heartbeat work is outside this scope.
 
-Dedicated machine secret lives only in protected runtime configuration and is
-accepted only by AIVE's production routes. Never use owner, OpenAI, Blotato or
-Supabase service credentials. The machine token does not authorize generation
-without an existing bounded owner grant. Daily paid protection must be expressed
-through AIVE's authoritative grant validity/cap; ingest has no spend ledger.
+## Offline verification
 
-AIVE source now supplies the machine endpoint candidate and read-only inspection
-migration 25090000. Migrations 25080000/25090000 remain NOT HOSTED. Narrow machine
-and database-worker credentials, server enablement, runtime verification and hosted
-acceptance remain pending. Existing Short generation requires local Kokoro/FFmpeg
-and reports unavailable on Vercel. No endpoint existence in source proves deployment.
-Live transport/job enablement requires a separately reviewed release change.
+Run:
+- npx tsx lib/broadcast/contentProduction.test.ts
+- npx tsx lib/broadcast/stillProductionManual.test.ts
+- npm run typecheck
 
-## Tests and preservation
-
-Run npx tsx lib/broadcast/contentProduction.test.ts and npm run typecheck.
-Tests use mocks only. Logs allow only result/reason, batch, numeric run identity,
-validated spec ID, enum states and elapsed time. No grant, token, raw error or URLs.
-All existing Broadcast schedules/publication workers and unrelated MCP work remain
-unchanged. No dependencies added. Future cadence remains undecided and disabled.
+Tests inject fake HTTP, including real AbortController cancellation against a
+mock fetch. Existing Broadcast crons and unrelated MCP work are preserved.
+No dependencies or package/lockfile changes are required.
