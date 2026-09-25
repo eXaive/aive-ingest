@@ -15,8 +15,8 @@ async function main(){
  const unknown=await scenario(pre,done,true);assert.equal(unknown.result.outcome,'UNKNOWN');assert.equal(unknown.calls.length,2);assert.ok(!JSON.stringify(unknown.result).includes('secret'));
  const calls:Request[]=[];const api:Transport=async req=>{calls.push(req);return{status:200,body:req.url.endsWith('/preflight')?pre:done};};await runProduction(config,api);await runProduction({...config,runId:'123:2'},api);
  assert.deepEqual(JSON.parse(calls[1].body),{...JSON.parse(calls[3].body),operational_run_id:'123:1'});assert.ok(!calls[1].body.includes('spec_id'));
- assert.equal(liveDisabled().reason,'LIVE_TRANSPORT_DISABLED');const yaml=readFileSync('.github/workflows/broadcast-content-production.yml','utf8');assert.ok(yaml.includes('workflow_dispatch:'));assert.ok(!/^\s*(schedule|cron):/m.test(yaml));assert.ok(!yaml.split('  live-still:')[0].includes('secrets.'));assert.ok(yaml.includes('secrets.AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET'));
+ assert.equal(liveDisabled().reason,'LIVE_TRANSPORT_DISABLED');const yaml=readFileSync('.github/workflows/broadcast-content-production.yml','utf8');assert.ok(yaml.includes('workflow_dispatch:'));assert.equal((yaml.match(/- cron:/g)??[]).length,1);assert.ok(yaml.includes("cron: '17 15 * * *'"));assert.ok(yaml.includes('secrets.AIVE_PRODUCTION_PILOT_GRANT_ID'));assert.ok(!yaml.split('  live-still:')[0].includes('secrets.'));assert.ok(yaml.includes('secrets.AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET'));
  assert.ok(!JSON.stringify(happy.result).includes(config.workerToken));assert.ok(!JSON.stringify(happy.result).includes(config.grantId));
- console.log('PASS: scope-only requests, strict response, shared/grant gates, one advance, UNKNOWN no retry, rerun carries no selection/action identity, no secrets, disabled workflow');
+ console.log('PASS: scope-only requests, strict response, shared/grant gates, one advance, UNKNOWN no retry, rerun carries no selection/action identity, no secrets, bounded daily workflow');
 }
 main().catch(()=>{console.error('FAIL: mocked production client');process.exitCode=1;});

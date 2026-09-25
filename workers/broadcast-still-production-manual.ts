@@ -13,7 +13,7 @@ export function httpTransport(fetcher:typeof fetch=fetch):Transport {
  };
 }
 export async function runManual(env:NodeJS.ProcessEnv,transport:Transport=httpTransport()):Promise<{report:Report;exitCode:number}> {
- if(env.GITHUB_ACTIONS!=='true'||env.GITHUB_EVENT_NAME!=='workflow_dispatch'||env.AIVE_PRODUCTION_MODE!=='live')return {report:liveDisabled(),exitCode:1};
+ if(env.GITHUB_ACTIONS!=='true'||!['workflow_dispatch','schedule'].includes(env.GITHUB_EVENT_NAME??'')||env.AIVE_PRODUCTION_MODE!=='live')return {report:liveDisabled(),exitCode:1};
  const report=await runProduction({origin:ORIGIN,workerToken:env.AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET??'',grantId:env.AIVE_PRODUCTION_GRANT_ID??'',runId:(env.GITHUB_RUN_ID??'')+':'+(env.GITHUB_RUN_ATTEMPT??'')},async request=>{
   const response=await transport(request);
   // This entry point accepts a Still start only; AIVE owns actual grant enforcement.

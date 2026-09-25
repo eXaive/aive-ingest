@@ -1,5 +1,7 @@
 name: Broadcast Content Production V1
 on:
+  schedule:
+    - cron: '17 15 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -19,7 +21,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   mocked-contract:
-    if: ${{ inputs.mode == 'mock' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'mock' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -32,7 +34,7 @@ jobs:
       - run: npx tsx lib/broadcast/contentProduction.test.ts
       - run: npx tsx lib/broadcast/stillProductionManual.test.ts
   live-still:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'live' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'live') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -44,7 +46,7 @@ jobs:
       - run: npm ci
       - name: Advance one authorized Still
         env:
-          AIVE_PRODUCTION_MODE: ${{ inputs.mode }}
-          AIVE_PRODUCTION_GRANT_ID: ${{ inputs.grant_id }}
+          AIVE_PRODUCTION_MODE: ${{ github.event_name == 'schedule' && 'live' || inputs.mode }}
+          AIVE_PRODUCTION_GRANT_ID: ${{ github.event_name == 'schedule' && secrets.AIVE_PRODUCTION_PILOT_GRANT_ID || inputs.grant_id }}
           AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET: ${{ secrets.AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET }}
         run: npx tsx workers/broadcast-still-production-manual.ts --live

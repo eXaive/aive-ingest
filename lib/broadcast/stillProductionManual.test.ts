@@ -9,9 +9,18 @@ async function scenario(options:{env?:NodeJS.ProcessEnv;pre?:unknown;done?:unkno
  const calls:Request[]=[];const result=await runManual(options.env??env,async r=>{calls.push(r);if(r.url.endsWith('/preflight'))return{status:200,body:options.pre===undefined?pre:options.pre};if(options.error)throw Error(env.AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET);return{status:options.status??200,body:options.done===undefined?done:options.done}});return{...result,calls};
 }
 async function main(){
+ // Scheduled calls retain the exact manual transport and one-advance boundary.
+ const scheduled={...env,GITHUB_EVENT_NAME:'schedule'};
+ const scheduledSuccess=await scenario({env:scheduled});assert.equal(scheduledSuccess.exitCode,0);assert.equal(scheduledSuccess.report.outcome,'PRODUCED_TO_SHORT_REQUIRED');assert.equal(scheduledSuccess.calls.filter(r=>r.url.endsWith('/advance')).length,1);
+ for(const change of [{AIVE_PRODUCTION_GRANT_ID:''},{AIVE_PRODUCTION_GRANT_ID:undefined},{AIVE_PRODUCTION_MODE:'mock'},{AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET:''}]){const r=await scenario({env:{...scheduled,...change}});assert.equal(r.calls.length,0);assert.equal(r.exitCode,1);}
+ for(const outcome of ['NO_ELIGIBLE_WORK','BLOCKED_GRANT','BLOCKED_COORDINATION_NOT_SHARED','UNKNOWN','FAILED_DEFINITE']){
+  const reply={...pre,production_enabled:false,outcome};
+  for(let invocation=0;invocation<2;invocation++){const r=await scenario({env:scheduled,pre:reply});assert.equal(r.calls.length,1);assert.equal(r.exitCode,outcome==='NO_ELIGIBLE_WORK'?0:1);}
+ }
+ for(const options of [{error:true},{done:{...done,outcome:'UNKNOWN',final_state:'BLOCKED'}}]){const r=await scenario({env:scheduled,...options});assert.equal(r.report.outcome,'UNKNOWN');assert.equal(r.exitCode,1);assert.equal(r.calls.length,2);}
  const good=await scenario();assert.equal(good.exitCode,0);assert.equal(good.report.outcome,'PRODUCED_TO_SHORT_REQUIRED');assert.equal(good.calls.length,2);assert.equal(good.calls[1].timeout_ms,330000);
  for(const r of good.calls){assert.equal(r.redirect,'error');assert.equal(r.headers.Authorization,'Bearer '+env.AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET);assert.deepEqual(Object.keys(JSON.parse(r.body)).sort(),['batch_id','contract','grant_id','operational_run_id']);}
- for(const change of [{GITHUB_ACTIONS:'false'},{GITHUB_EVENT_NAME:'schedule'},{AIVE_PRODUCTION_MODE:'mock'},{AIVE_PRODUCTION_MODE:''},{AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET:''},{AIVE_PRODUCTION_GRANT_ID:'bad'}]){const r=await scenario({env:{...env,...change}});assert.equal(r.calls.length,0);assert.equal(r.exitCode,1);}
+ for(const change of [{GITHUB_ACTIONS:'false'},{GITHUB_EVENT_NAME:'push'},{GITHUB_EVENT_NAME:'pull_request'},{GITHUB_EVENT_NAME:'repository_dispatch'},{GITHUB_EVENT_NAME:''},{AIVE_PRODUCTION_MODE:'mock'},{AIVE_PRODUCTION_MODE:''},{AIVE_BROADCAST_PRODUCTION_MACHINE_SECRET:''},{AIVE_PRODUCTION_GRANT_ID:'bad'}]){const r=await scenario({env:{...env,...change}});assert.equal(r.calls.length,0);assert.equal(r.exitCode,1);}
  for(const invalid of [null,{...pre,extra:'secret'},{...pre,grant_valid:false},{...pre,eligible_work:false},{...pre,coordination:'LOCAL'},{...pre,initial_state:'SHORT_REQUIRED'},done]){const r=await scenario({pre:invalid});assert.equal(r.calls.length,1);assert.equal(r.exitCode,1);}
  const noop=await scenario({pre:{...pre,production_enabled:false,outcome:'NO_ELIGIBLE_WORK'}});assert.equal(noop.exitCode,0);assert.equal(noop.calls.length,1);
  for(const invalid of [null,{...done,extra:'private URL'},{...done,final_state:'OWNER_REVIEW_REQUIRED'},{...done,outcome:'invented'},{...done,production_enabled:true}]){const r=await scenario({done:invalid});assert.equal(r.report.outcome,'UNKNOWN');assert.equal(r.report.reason,'TRANSPORT_UNCERTAIN');assert.equal(r.calls.length,2);assert.equal(r.exitCode,1);}
