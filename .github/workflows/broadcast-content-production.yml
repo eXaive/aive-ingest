@@ -1,0 +1,23 @@
+﻿name: Broadcast Content Production V1 (Mock Only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: broadcast-content-production-v1
+  cancel-in-progress: false
+jobs:
+  mocked-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify bounded orchestration with mocked AIVE
+        run: npx tsx lib/broadcast/contentProduction.test.ts
+# No schedule and no live job. Enablement requires a separate reviewed change
+# after narrow AIVE worker API/auth and hosted shared coordination acceptance.
