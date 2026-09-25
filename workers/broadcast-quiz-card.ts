@@ -230,15 +230,13 @@ export function buildCardText(row: {
 }
 
 /**
- * The post caption. The question plus the pool's hashtags -- discovery
- * metadata, which belongs in the feed but not drawn on the card.
- *
- * Deliberately does NOT carry the options (they are on the image), the answer,
- * or any system/brand framing.
+ * The post caption carries the show name, question and existing pool hashtags.
+ * Branding stays in outbound text; the rendered question card is unchanged.
+ * Options remain on the image, and the answer is never included.
  */
 export function buildCaption(row: { question_text: string }, hashtags: string): string {
   const question = row.question_text.trim();
-  return `${question}\n\nAnswer in the comments 👇\n\n${hashtags}`;
+  return `The Quiz Everything Show\n\n${question}\n\nAnswer in the comments 👇\n\n${hashtags}`;
 }
 
 /** Start the card render. Returns the creation id. */
