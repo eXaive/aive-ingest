@@ -226,6 +226,13 @@ const officialMeta = (item: MCPRegistryItem): MCPRegistryMeta | undefined =>
 
 const INTER_PAGE_DELAY_MS = 250;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 45_000]; // max 3 retry attempts
+/* Transport failures (no HTTP response: timeout, reset, DNS) get a longer tail than
+   status retries. 2026-10-05/06: the registry gave no response for longer than the
+   3-step ladder (~3 min) while the same request answered in <1 s before and after,
+   from the same runner path; the run budget is 20 min, so waiting out a short
+   unresponsive window is cheaper than losing the whole day. The budget guard below
+   still checkpoints instead of overrunning. 429/5xx keep RETRY_BACKOFF_MS. */
+export const TRANSPORT_RETRY_BACKOFF_MS: readonly number[] = [5_000, 15_000, 45_000, 120_000, 300_000];
 /* Per-request ceiling. Run #42 breached it when the registry degraded to
    ~8.9s/page; it is deliberately NOT raised here, because a longer timeout
    only delays the same failure. Breaching it is retryable. */
@@ -301,6 +308,8 @@ export async function fetchPageWithRetry(
   timeoutMs: number = FETCH_TIMEOUT_MS,
   /* Wall-clock instant the walk must stop by. Infinity = no budget. */
   deadlineMs: number = Number.POSITIVE_INFINITY,
+  /* Overridable for tests only (same reason as timeoutMs). */
+  transportBackoffMs: readonly number[] = TRANSPORT_RETRY_BACKOFF_MS,
 ): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
     const tFetch = Date.now();
@@ -313,11 +322,11 @@ export async function fetchPageWithRetry(
     } catch (err) {
       progress.fetchMs += Date.now() - tFetch;
       const detail = describeTransportError(err);
-      if (attempt >= RETRY_BACKOFF_MS.length) {
+      if (attempt >= transportBackoffMs.length) {
         throw new TransportFailure(detail);
       }
       // Retry-After is unavailable here — there are no headers to read.
-      const waitMs = RETRY_BACKOFF_MS[attempt];
+      const waitMs = transportBackoffMs[attempt];
       if (Date.now() + waitMs > deadlineMs) {
         console.log(
           `[ingest-mcp-registry] transport page=${progress.pagesAttempted} wait_ms=${waitMs} sleep_source=schedule ` +
@@ -328,7 +337,7 @@ export async function fetchPageWithRetry(
       progress.retries++;
       progress.retriesTransport++;
       console.log(
-        `[ingest-mcp-registry] transport page=${progress.pagesAttempted} attempt=${attempt + 1}/${RETRY_BACKOFF_MS.length} ` +
+        `[ingest-mcp-registry] transport page=${progress.pagesAttempted} attempt=${attempt + 1}/${transportBackoffMs.length} ` +
         `backoff_ms=${waitMs} sleep_source=schedule (${detail}) — halting pagination; retrying this page`,
       );
       const tBackoff = Date.now();
@@ -428,6 +437,8 @@ export interface WalkArgs {
   baseUrl?: string;
   timeoutMs?: number;
   deadlineMs?: number;
+  /** Tests only: transport retry ladder (defaults to TRANSPORT_RETRY_BACKOFF_MS). */
+  transportBackoffMs?: readonly number[];
   segmentPages?: number;
   interPageDelayMs?: number;
   /** Commit a batch. Resolve false to stop the walk (the store refused it). */
@@ -488,7 +499,7 @@ export async function walkRegistry(a: WalkArgs): Promise<WalkResult> {
 
     let res: Response;
     try {
-      res = await fetchPageWithRetry(url.toString(), a.progress, timeoutMs, deadlineMs);
+      res = await fetchPageWithRetry(url.toString(), a.progress, timeoutMs, deadlineMs, a.transportBackoffMs);
     } catch (err) {
       return stop('registry', err instanceof TransportFailure
         ? `Transport failure after retries: ${err.message}`
@@ -569,10 +580,11 @@ export async function fetchAllItems(
   startCursor: string | null,
   baseUrl: string = REGISTRY_BASE,
   timeoutMs: number = FETCH_TIMEOUT_MS,
+  transportBackoffMs?: readonly number[],
 ): Promise<FetchOutcome> {
   const items: MCPRegistryItem[] = [];
   const r = await walkRegistry({
-    progress, updatedSince, startCursor, baseUrl, timeoutMs,
+    progress, updatedSince, startCursor, baseUrl, timeoutMs, transportBackoffMs,
     segmentPages: Number.POSITIVE_INFINITY,
     onFlush: async (batch) => { items.push(...batch); return true; },
   });

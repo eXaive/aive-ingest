@@ -33,7 +33,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AddressInfo } from 'node:net';
 
-import { fetchPageWithRetry, fetchAllItems, isRetryableStatus, TransportFailure, type ScanProgress } from '../workers/ingest-mcp-registry';
+import { fetchPageWithRetry, fetchAllItems, isRetryableStatus, TransportFailure, TRANSPORT_RETRY_BACKOFF_MS, type ScanProgress } from '../workers/ingest-mcp-registry';
 
 const newProgress = (): ScanProgress => ({
   pages: 0, pagesAttempted: 0, retries: 0, retries429: 0, retries5xx: 0, retriesTransport: 0,
@@ -242,7 +242,8 @@ async function main(): Promise<void> {
     });
     await listen(s);
     const p = newProgress();
-    const outcome = await fetchAllItems(p, null, null, `http://127.0.0.1:${(s.address() as AddressInfo).port}`, 300);
+    // A short 3-step ladder keeps this test fast; the production ladder is asserted below.
+    const outcome = await fetchAllItems(p, null, null, `http://127.0.0.1:${(s.address() as AddressInfo).port}`, 300, [5_000, 15_000, 45_000]);
     await close(s);
 
     assert.equal(outcome.complete, false, 'the sweep did not finish');
@@ -252,6 +253,15 @@ async function main(): Promise<void> {
     assert.ok(outcome.failure?.includes('Transport failure'), `the reason is carried: ${outcome.failure}`);
     assert.equal(outcome.resumeCursor, 'io.example/one', 'the resume point is recorded');
     console.log(`  [8/8] transport exhaustion returned PARTIAL keeping ${outcome.items.length} server(s), resume_cursor=${outcome.resumeCursor}`);
+  }
+
+  // Production transport ladder: outlasts a multi-minute unresponsive window yet fits the
+  // 20-minute walk budget even with every attempt timing out at 30 s (2026-10-05/06 incident).
+  {
+    const waits = TRANSPORT_RETRY_BACKOFF_MS.reduce((a, b) => a + b, 0), attempts = TRANSPORT_RETRY_BACKOFF_MS.length + 1;
+    assert.ok(waits > 3 * 60_000, `transport ladder must outlast ~3 min of silence (waits ${waits}ms)`);
+    assert.ok(waits + attempts * 30_000 < 20 * 60_000, `transport ladder must fit the 20-minute budget (${waits + attempts * 30_000}ms)`);
+    console.log(`  [+] production transport ladder ${TRANSPORT_RETRY_BACKOFF_MS.join('/')}ms — worst case ${Math.round((waits + attempts * 30_000) / 1000)}s within the 1200s budget`);
   }
 
   // TransportFailure must stay distinguishable from a bad-status failure.
