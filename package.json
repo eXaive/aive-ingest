@@ -31,6 +31,9 @@
     "broadcast:text-card": "tsx workers/broadcast-text-card.ts",
     "broadcast:quiz-card": "tsx workers/broadcast-quiz-card.ts",
     "broadcast:reconcile": "tsx workers/reconcile-broadcast-publications.ts",
+    "broadcast:kids-distribution": "tsx workers/broadcast-kids-distribution.ts",
+    "verify:kids-distribution-worker": "tsx scripts/verify-kids-distribution-worker.ts",
+    "verify:reconcile-scope": "tsx scripts/verify-reconcile-scope.ts",
     "verify:insert-conflict-sql": "tsx scripts/verify-insert-conflict-sql.ts"
   },
   "dependencies": {

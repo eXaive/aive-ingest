@@ -60,6 +60,10 @@ jobs:
       # never registered in package.json cannot pass by silently not running.
       - name: verify:insert-conflict-sql
         run: npm run verify:insert-conflict-sql
+      - name: verify:kids-distribution-worker
+        run: npm run verify:kids-distribution-worker
+      - name: verify:reconcile-scope
+        run: npm run verify:reconcile-scope
       - name: verify:probe-run-evidence
         run: npm run verify:probe-run-evidence
       - name: verify:mcp-registry-outcome

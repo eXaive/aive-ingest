@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Broadcast Kids Distribution — hourly trigger for the 14 kids YouTube channels.
+#
+# EXECUTION PLANE ONLY. The worker makes one authenticated call to the deployed
+# AIVE app (POST /api/broadcast/distribution/daily-run). AIVE is the control
+# plane and decides everything: which channels are due at their own daily
+# publish time, Ready ordering, the frozen publication package, the exact
+# destination binding, one Short per channel per calendar day, stale-media and
+# curriculum checks, the single provider submission and its reconciliation.
+# A rerun in the same hour or day is idempotent in AIVE's database.
+#
+# SEPARATE FROM THE TIKTOK BROADCAST WORKFLOWS ON PURPOSE: different channels,
+# different destinations, different blast radius. It holds no database role and
+# no provider credentials, so it shares nothing with the scoped ingest role or
+# its connection limit.
+#
+# NOT ENABLED. Two independent gates:
+#   1. the hourly schedule below is commented out;
+#   2. the job runs only when repo variable KIDS_DISTRIBUTION_ENABLED == 'true'.
+# Only channels the owner enabled in Broadcast act.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints channel,
+# outcome and state codes only — never a response body, URL or id.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this
+# workflow holds the app's owner secret and must not be reachable from forks.
+#
+# Required repo secrets:
+#   AIVE_CRON_SECRET  Bearer for the app's requireOwnerAuth
+#   AIVE_BASE_URL     deployed app origin, e.g. https://aive.global (a SECRET,
+#                     not a variable, matching the other Broadcast workflows)
+#
+# NOTE: the deployed app must have DISTRIBUTION_MODE=live. Otherwise the route
+# refuses with 503 and this run is RED, never a green run that did nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Broadcast Kids Distribution
+
+on:
+  # schedule:
+  #   # Hourly wake at :07. Each channel publishes once its own slot_utc is due.
+  #   - cron: '7 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  # Never two at once. AIVE's database also enforces one Short per channel per
+  # day, so even an overlap could not double-publish; this is the cheaper first line.
+  group: broadcast-kids-distribution
+  cancel-in-progress: false
+
+jobs:
+  distribute:
+    if: vars.KIDS_DISTRIBUTION_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    # The app bounds a run at 300 s (maxDuration); the worker waits up to 320 s.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run due kids distribution
+        env:
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+        run: npx tsx workers/broadcast-kids-distribution.ts
