@@ -10,7 +10,9 @@ async function main() {
   for (const banned of [/lib\/ingest\/db/, /\bpg\b/, /supabase/i, /DATABASE_URL/, /BLOTATO/i, /YOUTUBE/i, /blotato\.com/i, /googleapis/i,
     /slot_utc|ready_id|publication_package|binding|cadence|orderQueue|checksum/i, /import /])
     assert.ok(!banned.test(src), 'worker must stay thin: ' + banned);
-  assert.ok(!fs.readFileSync('.github/workflows/broadcast-kids-distribution.yml', 'utf8').match(/^\s*(schedule:|- cron:)/m), 'cron must stay commented out');
+  // Activated 2026-10-06: exactly one hourly schedule at :07, nothing more frequent.
+  const crons = [...fs.readFileSync('.github/workflows/broadcast-kids-distribution.yml', 'utf8').replace(/#.*$/gm, '').matchAll(/^\s*- cron:\s*'([^']+)'/gm)].map(m => m[1]);
+  assert.deepEqual(crons, ['7 * * * *'], 'exactly the approved hourly cron');
   assert.ok(!/pull_request/.test(fs.readFileSync('.github/workflows/broadcast-kids-distribution.yml', 'utf8').replace(/#.*$/gm, '')), 'never on pull_request');
 
   const calls: Array<{ url: string; init: RequestInit }> = [];

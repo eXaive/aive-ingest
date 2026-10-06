@@ -14,10 +14,11 @@
 # no provider credentials, so it shares nothing with the scoped ingest role or
 # its connection limit.
 #
-# NOT ENABLED. Two independent gates:
-#   1. the hourly schedule below is commented out;
-#   2. the job runs only when repo variable KIDS_DISTRIBUTION_ENABLED == 'true'.
-# Only channels the owner enabled in Broadcast act.
+# ENABLED 2026-10-06 (owner-authorized). Two independent gates remain:
+#   1. the hourly schedule below (stop by commenting it out again);
+#   2. the job runs only when repo variable KIDS_DISTRIBUTION_ENABLED == 'true'
+#      (the fastest stop: delete the variable or set it to false).
+# Only channels the owner enabled in Broadcast act, each at its own slot_utc.
 #
 # THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints channel,
 # outcome and state codes only — never a response body, URL or id.
@@ -36,9 +37,9 @@
 name: Broadcast Kids Distribution
 
 on:
-  # schedule:
-  #   # Hourly wake at :07. Each channel publishes once its own slot_utc is due.
-  #   - cron: '7 * * * *'
+  schedule:
+    # Hourly wake at :07. Each channel publishes once its own slot_utc is due.
+    - cron: '7 * * * *'
   workflow_dispatch:
 
 concurrency:
