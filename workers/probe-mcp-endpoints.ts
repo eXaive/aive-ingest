@@ -49,6 +49,16 @@ const RATE_LIMIT_BACKOFF_MS = 5_000; // extra host spacing after a 429
 const TIMEOUT_MS = 10_000;
 const MAX_REDIRECTS = 2;
 const INSERT_CHUNK = 500;
+/** Waits before re-sending a chunk refused with too_many_connections (SQLSTATE
+ *  53300). aive_ingest has CONNECTION LIMIT 4 shared by every worker, and
+ *  delayed GitHub schedules let otherwise-disjoint MCP workflows overlap
+ *  (2026-10-06: the listing collector started 14:47Z inside this sweep; one
+ *  500-row chunk was lost at 14:50Z). The refusal happens at connect, before
+ *  any row is written, and the insert is ON CONFLICT DO NOTHING, so a re-send
+ *  cannot duplicate. ~3 min total, then the chunk fails as before (PARTIAL). */
+export const CONNECTION_LIMIT_RETRY_MS: readonly number[] = [5_000, 15_000, 45_000, 120_000];
+const isConnectionLimit = (err: unknown): boolean =>
+  (err as { code?: unknown } | null)?.code === '53300';
 export const PROBE_VANTAGE_ID = 'github-actions-default';
 export const COLLECTOR_ENVIRONMENT = 'github_actions';
 export const PROBE_POLICY_VERSION = 'mcp-reachability-v1';
@@ -318,6 +328,8 @@ export interface ProbeExecutionDependencies {
   insert: typeof insertRows;
   probe: typeof probeEndpoint;
   now: () => Date;
+  /** Injected so verification does not really wait out the connection-limit backoff. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 const defaultDependencies: ProbeExecutionDependencies = {
@@ -502,8 +514,11 @@ export async function probeMcpEndpoints(
     if (pending.length === 0) return;
     const chunk = pending;
     pending = [];
-    try {
-      const inserted = await dependencies.insert('mcp_endpoint_probes', COLS, chunk.map((r) => [
+    const sleep = dependencies.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const insertChunk = async (): Promise<number> => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await dependencies.insert('mcp_endpoint_probes', COLS, chunk.map((r) => [
         r.server_id, r.endpoint_url, r.probed_at, r.http_status, r.response_time_ms,
         r.error_class, r.tls_valid, r.redirect_target, r.note,
         // jsonb pre-serialized per lib/ingest/db contract (node-pg would
@@ -511,7 +526,17 @@ export async function probeMcpEndpoints(
         r.probe_method, r.content_type,
         r.response_headers ? JSON.stringify(r.response_headers) : null,
         probeRunId, 'REACHABILITY',
-      ]), 'probe_run_id, server_id, endpoint_url, observation_kind', 'probe_run_id IS NOT NULL');
+          ]), 'probe_run_id, server_id, endpoint_url, observation_kind', 'probe_run_id IS NOT NULL');
+        } catch (err) {
+          if (!isConnectionLimit(err) || attempt >= CONNECTION_LIMIT_RETRY_MS.length) throw err;
+          const wait = CONNECTION_LIMIT_RETRY_MS[attempt];
+          console.warn(`[probe-mcp-endpoints] insert chunk (${chunk.length} rows) refused: role connection limit; retry ${attempt + 1}/${CONNECTION_LIMIT_RETRY_MS.length} in ${wait / 1000}s`);
+          await sleep(wait);
+        }
+      }
+    };
+    try {
+      const inserted = await insertChunk();
       /* Count what LANDED, not what was sent. DO NOTHING makes those differ,
          and persisted feeds the COMPLETE/PARTIAL run state -- crediting a
          skipped row would report a lossy run as complete.

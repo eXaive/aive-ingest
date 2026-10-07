@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   probeEndpoint,
   probeMcpEndpoints,
+  CONNECTION_LIMIT_RETRY_MS,
   type ProbeExecutionDependencies,
   type ProbeRow,
   type ProbeRunProvenance,
@@ -24,7 +25,7 @@ function row(serverId: string, url: string, method: ProbeRow['probe_method'] = '
   };
 }
 
-function fixture(options: { runId: string; endpoints?: number; failInsertCall?: number; failRunCreation?: boolean; probeThrowAt?: number }) {
+function fixture(options: { runId: string; endpoints?: number; failInsertCall?: number; failRunCreation?: boolean; probeThrowAt?: number; connectionLimitRefusals?: number }) {
   const calls: string[] = [];
   const runStates: Array<{ state: string; values: unknown[] }> = [];
   const insertedRows: unknown[][] = [];
@@ -61,6 +62,9 @@ function fixture(options: { runId: string; endpoints?: number; failInsertCall?: 
   const insert: ProbeExecutionDependencies['insert'] = async (_table, _columns, rows) => {
     insertCall++;
     if (options.failInsertCall === insertCall) throw new Error('fixture persistence failure');
+    if (insertCall <= (options.connectionLimitRefusals ?? 0)) {
+      throw Object.assign(new Error('too many connections for role "aive_ingest"'), { code: '53300' });
+    }
     insertedRows.push(...rows);
     return rows.length;
   };
@@ -69,10 +73,12 @@ function fixture(options: { runId: string; endpoints?: number; failInsertCall?: 
     if (options.probeThrowAt === probes) throw new Error('fixture collector abort');
     return row(serverId, url);
   };
+  const sleeps: number[] = [];
   const dependencies: ProbeExecutionDependencies = {
     query, insert, probe, now: () => new Date('2026-09-04T12:00:00.000Z'),
+    sleep: async (ms) => { sleeps.push(ms); },
   };
-  return { dependencies, calls, runStates, insertedRows, get probes() { return probes; } };
+  return { dependencies, calls, runStates, insertedRows, sleeps, get probes() { return probes; } };
 }
 
 async function main() {
@@ -100,6 +106,26 @@ async function main() {
   assert.equal(partialResult.errors, 1);
   assert.equal(partial.runStates.at(-1)?.state, 'PARTIAL');
   assert.deepEqual(partial.runStates.at(-1)?.values.slice(2, 10), [501, 501, 501, 501, 500, 0, 1, 0]);
+
+  // A chunk refused at connect by the role connection limit is re-sent after
+  // the bounded backoff and lands; nothing else is retried.
+  const contended = fixture({ runId: 'run-contended', endpoints: 2, connectionLimitRefusals: 2 });
+  const contendedResult = await probeMcpEndpoints(contended.dependencies, provenance);
+  assert.equal(contendedResult.errors, 0);
+  assert.equal(contended.insertedRows.length, 2);
+  assert.deepEqual(contended.sleeps, [5_000, 15_000]);
+  assert.equal(contended.runStates.at(-1)?.state, 'COMPLETE');
+
+  // Past the ladder the chunk fails exactly as before: counted, PARTIAL, never silent.
+  const exhausted = fixture({ runId: 'run-exhausted', endpoints: 2, connectionLimitRefusals: 99 });
+  const exhaustedResult = await probeMcpEndpoints(exhausted.dependencies, provenance);
+  assert.equal(exhaustedResult.errors, 1);
+  assert.deepEqual(exhausted.sleeps, [...CONNECTION_LIMIT_RETRY_MS]);
+  assert.equal(exhausted.insertedRows.length, 0);
+  assert.notEqual(exhausted.runStates.at(-1)?.state, 'COMPLETE');
+
+  // Any other persistence error is not retried.
+  assert.deepEqual(partial.sleeps, []);
 
   const aborted = fixture({ runId: 'run-aborted', endpoints: 2, probeThrowAt: 2 });
   await assert.rejects(() => probeMcpEndpoints(aborted.dependencies, provenance), /collector abort/);
