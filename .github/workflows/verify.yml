@@ -60,6 +60,8 @@ jobs:
       # never registered in package.json cannot pass by silently not running.
       - name: verify:insert-conflict-sql
         run: npm run verify:insert-conflict-sql
+      - name: verify:insert-rows-chunking
+        run: npm run verify:insert-rows-chunking
       - name: verify:ou1comes-promo-rotation
         run: npm run verify:ou1comes-promo-rotation
       - name: verify:kids-distribution-worker

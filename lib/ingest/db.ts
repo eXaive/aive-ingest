@@ -90,8 +90,15 @@ export async function upsertRows<T = Record<string, unknown>>(opts: {
   return res.rows as T[];
 }
 
+// Postgres caps one statement at 65,535 bind parameters. Past that, the protocol's
+// 16-bit count wraps and the server reports "bind message has N parameter formats
+// but 0 parameters".
+export const PG_MAX_BIND_PARAMS = 65535;
+
 /**
- * Multi-row INSERT. No RETURNING.
+ * Multi-row INSERT. No RETURNING. Batches wider than PG_MAX_BIND_PARAMS are
+ * split into several statements (not one transaction); the return value is the
+ * total across them.
  *
  * @param conflictTarget  When set, appends ON CONFLICT (<target>) DO NOTHING.
  *   OPT-IN, never the default: every other caller treats a duplicate as a real
@@ -106,6 +113,14 @@ export async function insertRows(
 ): Promise<number> {
   if (rows.length === 0) return 0;
   const width = cols.length;
+  const maxRows = Math.floor(PG_MAX_BIND_PARAMS / width);
+  if (rows.length > maxRows) {
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += maxRows) {
+      inserted += await insertRows(table, cols, rows.slice(i, i + maxRows), conflictTarget, conflictWhere);
+    }
+    return inserted;
+  }
   const values: unknown[] = [];
   const tuples = rows.map((row, r) => {
     values.push(...row);

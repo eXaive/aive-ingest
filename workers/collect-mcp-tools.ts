@@ -50,7 +50,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { q, ingestPool, endIngestPool, logIngestionPg } from '../lib/ingest/db';
+import { q, ingestPool, endIngestPool, logIngestionPg, PG_MAX_BIND_PARAMS } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
 // Operator opt-outs, SHARED with discover-mcp-servers.ts. Not a second copy of
 // the matching rules: this worker's dispatch loop already restates runSweep's
@@ -641,10 +641,13 @@ export async function persistCaptureAtomically(
       );
       const captureId = inserted.rows[0]?.id;
       if (!captureId) throw new Error('capture insert returned no id');
-      if (c.tools.length > 0) {
-        const width = TOOL_COLS.length;
+      // Chunked to stay under Postgres's bind-parameter cap. Every chunk runs on
+      // this transaction's client, so the capture is still all-or-nothing.
+      const width = TOOL_COLS.length;
+      const maxRows = Math.floor(PG_MAX_BIND_PARAMS / width);
+      for (let start = 0; start < c.tools.length; start += maxRows) {
         const values: unknown[] = [];
-        const tuples = c.tools.map((t, row) => {
+        const tuples = c.tools.slice(start, start + maxRows).map((t, row) => {
           const data = [
             captureId, c.server_id, c.endpoint_url, t.tool_name, t.tool_title,
             t.description,
