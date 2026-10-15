@@ -1,0 +1,93 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Workflow Failure Alert — one notification per failed scheduled-workflow run.
+#
+# WHY workflow_run AND NOT A STEP IN EACH WORKFLOW. The 15 scheduled workflows
+# stay byte-for-byte unchanged: no added steps, no `if: failure()` hooks, no new
+# secrets in jobs that publish or write data. A failure anywhere in a run —
+# including a job that never starts — ends as a completed run here.
+#
+# COVERAGE. `workflows:` must list every workflow with a `schedule:` trigger, by
+# its exact `name:`. scripts/verify-failure-alert-coverage.ts fails CI when a
+# scheduled workflow is missing from this list or a listed name no longer exists.
+#
+# WHAT ALERTS. Conclusion failure, timed_out or startup_failure. Success,
+# cancelled and skipped runs produce a skipped job here (no runner minutes).
+# Concurrency group per WORKFLOW NAME below, so two failures of one workflow
+# cannot both find "no open issue" and open two; per-run marker dedupe in the
+# worker. GitHub keeps one running + one pending per group: a third alert for
+# the same workflow arriving while two are queued replaces the pending one.
+#
+# CHANNEL. A GitHub issue labelled `workflow-failure`, assigned to the repo
+# owner: one open issue per failing workflow, later failed runs added as
+# comments, a closed issue re-arms. Email (Resend) is coded but DISABLED in the
+# worker (EMAIL_ENABLED = false) until aive.global has a verified sending
+# domain; the RESEND_* / ALERT_EMAIL_* secrets below are unused until then.
+# See workers/workflow-failure-alert.ts.
+#
+# SAFETY. workflow_run always runs THIS file from the default branch, never code
+# from the triggering run. None of the listed workflows run on pull_request, so
+# a fork cannot trigger it. Token scope: read Actions, write Issues (issues,
+# comments and the one label), nothing else.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints run id,
+# workflow name and channel only.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Workflow Failure Alert
+
+on:
+  workflow_run:
+    workflows:
+      - 'Broadcast Content Production V1'
+      - 'Broadcast Daily Post'
+      - 'Broadcast Kids Distribution'
+      - 'Broadcast Quiz Card (Cat)'
+      - 'Broadcast Quiz Card (GTA)'
+      - 'Broadcast Text Card'
+      - 'MCP Listing Collection (tools, resources, prompts)'
+      - 'MCP server/discover Sweep'
+      - 'Homebrew Formulae Ingest'
+      - 'MCP Governance Mirror'
+      - 'MCP Registry Ingest'
+      - 'npm SDK Packages Ingest'
+      - 'Ingest Watchdog'
+      - 'Webhook Providers Ingest'
+      - 'MCP Endpoint Probes'
+    types: [completed]
+
+permissions:
+  actions: read
+  issues: write
+
+concurrency:
+  group: workflow-failure-alert-${{ github.event.workflow_run.name }}
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    if: contains(fromJSON('["failure","timed_out","startup_failure"]'), github.event.workflow_run.conclusion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Send alert
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+        run: npx tsx workers/workflow-failure-alert.ts
