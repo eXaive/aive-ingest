@@ -1,0 +1,68 @@
+-- OU1COMES promo topics for the Daily Post rotation (lib/broadcast/promoRotation.ts).
+--
+-- PROPOSAL -- NOT APPLIED. Data rows only: no table, column, constraint, function
+-- or grant changes. Apply only with explicit owner approval, after reviewing the
+-- copy below; the worker publishes caption verbatim.
+--
+-- Marked by the topic_name prefix 'OU1COMES:'. layer stays NULL (its CHECK only
+-- admits the seven protocol layers). No pregenerated_media_url, so every
+-- promotion day renders a new video from prompt_seed. Idempotent on topic_name.
+--
+-- Accuracy (checked against www.outcomes.services, 2026-10-14): the live product
+-- finds MCP servers, saves them and shows their available tools/capabilities.
+-- Requests are not submitted or executed, and monitoring is not promised here.
+-- Visual brand OU1COMES; spoken brand "Outcomes"; site www.outcomes.services.
+--
+-- Revision 2 (2026-10-15), after the private test render (Blotato creation
+-- 4bbe982a-0a46-4ec0-b999-71df47c1fd9b): captions UNCHANGED from the approved
+-- copy. Each prompt gains one "Visuals:" sentence, because the template invented
+-- a product screen listing "Monitoring & Logs" and "Security Console", features
+-- Outcomes does not offer. Brand card, spoken "Outcomes" and website were correct.
+
+INSERT INTO broadcast_topic_queue
+  (topic_name, layer, evidence_status, category, secondary_category_label,
+   queue_position, status, prompt_seed, caption)
+VALUES
+  ('OU1COMES: Find MCP servers', NULL, 'LIVE - OWN PRODUCT', NULL, 'Promotion', 101, 'pending',
+   'A short vertical TikTok promotional video for Outcomes, a website at www.outcomes.services. '
+   'Open on the problem: there are thousands of MCP servers, the connectors that let AI agents use '
+   'external tools, and finding the right one is hard. Then show the answer: on Outcomes you search '
+   'for MCP servers that fit what you need, save the ones that matter, and see the tools each one '
+   'offers. Close on the website, www.outcomes.services. Any on-screen brand text reads OU1COMES '
+   'exactly. The narrator always says the name as the word Outcomes and never spells it out. Do not '
+   'claim that it monitors, runs or executes anything. Visuals: abstract only, such as a glowing '
+   'network of connected nodes, a search icon, a bookmark icon and simple tool icons. Do not show any '
+   'app screen, dashboard, device, menu, server list or interface, and no on-screen words other than '
+   'the captions and a final card reading OU1COMES and www.outcomes.services. Use three beats. Start '
+   'with a strong opening line, keep the middle factual, and finish on one short line. Clear, '
+   'confident, friendly tone. Captions on.',
+   'Thousands of MCP servers. Find the right one on OU1COMES: search, save, and see what each can do. www.outcomes.services #MCP #AIagents #AI'),
+
+  ('OU1COMES: Explore capabilities', NULL, 'LIVE - OWN PRODUCT', NULL, 'Promotion', 102, 'pending',
+   'A short vertical TikTok promotional video for Outcomes, a website at www.outcomes.services. '
+   'Open on the question: before you connect an AI agent to an MCP server, what can it actually do? '
+   'Then explain that Outcomes lets you explore each server''s available capabilities, the tools it '
+   'lists and the inputs they take, before you choose one. Close on the website, '
+   'www.outcomes.services. Any on-screen brand text reads OU1COMES exactly. The narrator always says '
+   'the name as the word Outcomes and never spells it out. Do not claim that it monitors, runs or '
+   'executes anything. Visuals: abstract only, such as a glowing network of connected nodes, a search '
+   'icon, a bookmark icon and simple tool icons. Do not show any app screen, dashboard, device, menu, '
+   'server list or interface, and no on-screen words other than the captions and a final card reading '
+   'OU1COMES and www.outcomes.services. Use three beats. Start with a strong opening line, keep the '
+   'middle factual, and finish on one short line. Clear, confident, friendly tone. Captions on.',
+   'Before you connect an MCP server, see what it can actually do. Explore capabilities on OU1COMES. www.outcomes.services #MCP #AIagents #AI'),
+
+  ('OU1COMES: Start from the outcome', NULL, 'LIVE - OWN PRODUCT', NULL, 'Promotion', 103, 'pending',
+   'A short vertical TikTok promotional video for Outcomes, a website at www.outcomes.services. '
+   'Open on the idea: start from what you want done, not from a list of protocols. Then explain that '
+   'on Outcomes you describe the outcome you want and discover MCP servers, and the capabilities they '
+   'offer, that could help you get there. Close on the website, www.outcomes.services. Any on-screen '
+   'brand text reads OU1COMES exactly. The narrator always says the name as the word Outcomes and '
+   'never spells it out. Do not claim that it monitors, runs or executes anything. Visuals: abstract '
+   'only, such as a glowing network of connected nodes, a search icon, a bookmark icon and simple '
+   'tool icons. Do not show any app screen, dashboard, device, menu, server list or interface, and no '
+   'on-screen words other than the captions and a final card reading OU1COMES and '
+   'www.outcomes.services. Use three beats. Start with a strong opening line, keep the middle '
+   'factual, and finish on one short line. Clear, confident, friendly tone. Captions on.',
+   'Start with the outcome you want. Discover the MCP servers that can help. OU1COMES, www.outcomes.services #MCP #AIagents #AI')
+ON CONFLICT (topic_name) DO NOTHING;

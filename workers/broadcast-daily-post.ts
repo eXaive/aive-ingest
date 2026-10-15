@@ -48,6 +48,7 @@
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
+import { isPromoDay, topicPoolPredicate } from '../lib/broadcast/promoRotation';
 
 /* mister.mcp.a2a — broadcast_accounts.id. The OTHER TWO CONNECTED ACCOUNTS
    (vice.marshal.kyli, wwwsnowbunnymafiacom) ARE OUT OF SCOPE for this
@@ -100,8 +101,13 @@ interface TopicRow {
  * Oldest pending topic. When every topic has been used the queue LOOPS: all
  * used rows go back to pending and the rotation starts again. Running out of
  * topics is the expected steady state after 17 days, not an error.
+ *
+ * Monday/Wednesday/Friday (UTC) draw from the OU1COMES promo pool, the other
+ * days from the regular pool (lib/broadcast/promoRotation.ts). Each pool loops
+ * on its own. A promotion day with no promo rows at all falls back to the
+ * regular pool, so the daily video never stops for want of promo copy.
  */
-async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
+export async function nextTopic(forceName: string | null, now: Date = new Date()): Promise<TopicRow | null> {
   if (forceName) {
     const rows = await q<TopicRow>(
       `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
@@ -118,29 +124,39 @@ async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
      It happened to be a reasonable sequence, but it was an accident a rename
      or a newly inserted row would silently change, and posting order on a
      public channel should be a decision. */
-  const pick = async () =>
-    (await q<TopicRow>(
-      `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
-              pregenerated_media_url
-         FROM broadcast_topic_queue
-        WHERE status = 'pending'
-        ORDER BY queue_position
-        LIMIT 1`,
-    ))[0] ?? null;
+  const fromPool = async (promo: boolean): Promise<TopicRow | null> => {
+    const pool = topicPoolPredicate(promo);
+    const pick = async () =>
+      (await q<TopicRow>(
+        `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
+                pregenerated_media_url
+           FROM broadcast_topic_queue
+          WHERE status = 'pending' AND ${pool}
+          ORDER BY queue_position
+          LIMIT 1`,
+      ))[0] ?? null;
 
-  const first = await pick();
-  if (first) return first;
+    const first = await pick();
+    if (first) return first;
 
-  // Loop back. 'skipped' rows are deliberately NOT revived — a human skipped
-  // them and that decision should survive the rotation.
-  const reset = await q<{ id: string }>(
-    `UPDATE broadcast_topic_queue
-        SET status = 'pending', used_at = NULL
-      WHERE status = 'used'
-      RETURNING id`,
-  );
-  console.log(`[broadcast-daily] queue exhausted — looped ${reset.length} topic(s) back to pending`);
-  return pick();
+    // Loop back. 'skipped' rows are deliberately NOT revived — a human skipped
+    // them and that decision should survive the rotation.
+    const reset = await q<{ id: string }>(
+      `UPDATE broadcast_topic_queue
+          SET status = 'pending', used_at = NULL
+        WHERE status = 'used' AND ${pool}
+        RETURNING id`,
+    );
+    console.log(`[broadcast-daily] ${promo ? 'promo' : 'regular'} queue exhausted — looped ${reset.length} topic(s) back to pending`);
+    return pick();
+  };
+
+  if (isPromoDay(now)) {
+    const promo = await fromPool(true);
+    if (promo) return promo;
+    console.log('[broadcast-daily] promotion day but no promo topic is available — using the regular rotation');
+  }
+  return fromPool(false);
 }
 
 /* Hard ceiling across BOTH formats for this account, per UTC day. Kept
@@ -402,11 +418,14 @@ async function main(): Promise<void> {
   console.log(`[broadcast-daily] DONE topic=${topic.topic_name} job=${jobId} elapsed_s=${((Date.now() - startedAt) / 1000).toFixed(0)}`);
 }
 
-main()
-  .then(async () => { await endIngestPool(); })
-  .catch(async (err) => {
-    // Message only. Never the stack's captured values, never a response body.
-    console.error(`[broadcast-daily] FAILED: ${err instanceof Error ? err.message : String(err)}`);
-    await endIngestPool().catch(() => {});
-    process.exit(1);
-  });
+// Guarded so the topic selection can be imported by scripts/verify-*.
+if (require.main === module) {
+  main()
+    .then(async () => { await endIngestPool(); })
+    .catch(async (err) => {
+      // Message only. Never the stack's captured values, never a response body.
+      console.error(`[broadcast-daily] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      await endIngestPool().catch(() => {});
+      process.exit(1);
+    });
+}

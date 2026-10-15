@@ -40,6 +40,7 @@
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
+import { topicPoolPredicate } from '../lib/broadcast/promoRotation';
 
 /* mister.mcp.a2a. The other two connected accounts (vice.marshal.kyli,
    wwwsnowbunnymafiacom) are out of scope and must never appear here. */
@@ -103,8 +104,11 @@ const TOPIC_COLS = 'id, topic_name, layer, evidence_status, caption';
  *
  * status <> 'skipped' is honoured here too. One skip flag, both formats: the
  * AIVE topic is withheld from the channel entirely, not merely from video.
+ *
+ * OU1COMES promo rows are video-only (lib/broadcast/promoRotation.ts) and are
+ * excluded from the card rotation.
  */
-async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
+export async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
   if (forceName) {
     const rows = await q<TopicRow>(
       `SELECT ${TOPIC_COLS} FROM broadcast_topic_queue
@@ -117,7 +121,7 @@ async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
   const pick = async () =>
     (await q<TopicRow>(
       `SELECT ${TOPIC_COLS} FROM broadcast_topic_queue
-        WHERE used_as_card = false AND status <> 'skipped'
+        WHERE used_as_card = false AND status <> 'skipped' AND ${topicPoolPredicate(false)}
         ORDER BY queue_position
         LIMIT 1`,
     ))[0] ?? null;
@@ -127,7 +131,7 @@ async function nextTopic(forceName: string | null): Promise<TopicRow | null> {
 
   const reset = await q<{ id: string }>(
     `UPDATE broadcast_topic_queue SET used_as_card = false
-      WHERE used_as_card = true AND status <> 'skipped' RETURNING id`,
+      WHERE used_as_card = true AND status <> 'skipped' AND ${topicPoolPredicate(false)} RETURNING id`,
   );
   console.log(`[broadcast-card] card rotation exhausted — looped ${reset.length} topic(s) back`);
   return pick();
