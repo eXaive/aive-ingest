@@ -64,6 +64,8 @@ jobs:
         run: npm run verify:insert-rows-chunking
       - name: verify:failure-alert
         run: npm run verify:failure-alert
+      - name: verify:watch-evaluation-trigger
+        run: npm run verify:watch-evaluation-trigger
       - name: verify:ou1comes-promo-rotation
         run: npm run verify:ou1comes-promo-rotation
       - name: verify:kids-distribution-worker

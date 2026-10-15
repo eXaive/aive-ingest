@@ -274,6 +274,30 @@ jobs:
           AIVE_TOOL_COLLECTOR_VERSION: ${{ github.sha }}
         run: npm run collect:mcp-tools
 
+      # WATCH MONITOR TICK. Wakes the app's fenced monitor tick right after the
+      # tools/list sweep, which is the only listing Watch reads; it does not wait
+      # for resources/prompts. The body is { trigger: 'MONITOR_TICK' } and nothing
+      # else: the app claims due watches from its own checkpoint table, so this
+      # step asserts nothing about the sweep. Rationale: aive-platform
+      # docs/mcp/watch-evaluation-ingest-coupling.md.
+      #
+      # INERT UNTIL THE OWNER SETS repo variable MCP_WATCH_MONITOR_TICK_ENABLED to
+      # 'true'. Without it the step is skipped (outcome 'skipped', never
+      # 'failure'), so this job does not go red every day while the app still
+      # answers SETUP_REQUIRED / MONITORING_DISABLED and the evaluator token
+      # secret does not exist. The fastest stop: delete the variable.
+      #
+      # No database credential: only the app origin and the dedicated evaluator
+      # bearer. A failure is counted by the gate step below, like a sweep.
+      - name: Evaluate MCP Watches
+        id: watch
+        if: always() && steps.tools.outcome != 'skipped' && vars.MCP_WATCH_MONITOR_TICK_ENABLED == 'true'
+        continue-on-error: true
+        env:
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          MCP_WATCH_EVALUATOR_TOKEN: ${{ secrets.MCP_WATCH_EVALUATOR_TOKEN }}
+        run: npx tsx workers/mcp-watch-evaluation-trigger.ts
+
       - name: Collect resources/list
         id: resources
         continue-on-error: true
@@ -300,12 +324,14 @@ jobs:
           echo "tools/list     : ${{ steps.tools.outcome }}"
           echo "resources/list : ${{ steps.resources.outcome }}"
           echo "prompts/list   : ${{ steps.prompts.outcome }}"
+          echo "watch tick     : ${{ steps.watch.outcome }}"
           failed=0
           [ "${{ steps.tools.outcome }}" = "failure" ] && failed=1
           [ "${{ steps.resources.outcome }}" = "failure" ] && failed=1
           [ "${{ steps.prompts.outcome }}" = "failure" ] && failed=1
+          [ "${{ steps.watch.outcome }}" = "failure" ] && failed=1
           if [ "$failed" = "1" ]; then
-            echo "::error::at least one collector failed -- the other sweeps still ran and their captures are written"
+            echo "::error::at least one step failed -- the other steps still ran and their captures are written"
             exit 1
           fi
-          echo "all three collectors succeeded"
+          echo "all collectors succeeded (watch tick: ${{ steps.watch.outcome }})"
