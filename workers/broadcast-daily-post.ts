@@ -47,7 +47,7 @@
 
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
-import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
+import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending, stalledAttemptMessage } from '../lib/broadcast/publicationAttempts';
 import { isPromoDay, topicPoolPredicate } from '../lib/broadcast/promoRotation';
 
 /* mister.mcp.a2a — broadcast_accounts.id. The OTHER TWO CONNECTED ACCOUNTS
@@ -332,6 +332,9 @@ async function main(): Promise<void> {
     return;
   }
   if (attempt.state !== 'reserved' || attempt.lease_owner !== leaseOwner) {
+    // Someone else's attempt holds this intent. Fresh: it may still be in flight. Past 6 h: a stall -- fail the run.
+    const stalled = stalledAttemptMessage(attempt);
+    if (stalled) throw new Error(stalled);
     console.log(`[broadcast-daily] existing attempt state=${attempt.state}; no render or provider submission`);
     return;
   }

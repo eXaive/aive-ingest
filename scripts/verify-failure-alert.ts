@@ -102,7 +102,7 @@ const env = (runId: number, conclusion = 'failure', extra: Record<string, string
 const RESEND = { RESEND_API_KEY: 'k', ALERT_EMAIL_TO: 'to@example.test' };
 
 async function main(): Promise<void> {
-  assert.equal(scheduled.length, 15, `expected 15 scheduled workflows, found ${scheduled.length}`);
+  assert.equal(scheduled.length, 16, `expected 16 scheduled workflows, found ${scheduled.length}`);
   for (const n of scheduled) assert.ok(listed.includes(n), `scheduled workflow not covered by ${ALERT_FILE}: "${n}"`);
   for (const n of listed) assert.ok(scheduled.includes(n), `${ALERT_FILE} lists a workflow that is not scheduled or no longer exists: "${n}"`);
   assert.equal(new Set(listed).size, listed.length, 'duplicate entry in workflows list');

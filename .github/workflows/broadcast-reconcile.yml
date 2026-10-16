@@ -1,0 +1,64 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Broadcast Publication Reconcile — hourly confirmation of TikTok publications.
+#
+# WHY. A worker that cannot confirm its own post within its poll window leaves the
+# attempt in provider_accepted / confirmation_pending. Until something confirms it,
+# that worker re-lands on the same intent every run and posts nothing (Quiz Card
+# (Cat), 2026-10-09 → 2026-10-16: a published post never confirmed, 7 days silent).
+# This runs the existing reconciler (workers/reconcile-broadcast-publications.ts):
+# GET status reads only, no provider create call; a definite Blotato `failed`
+# marks the attempt failed, anything uncertain leaves it pending for the next hour.
+# Kids YouTube distribution attempts are out of scope (AIVE reconciles those).
+#
+# POSTED-NOTHING CHECK. After reconciling, the run FAILS when an account in
+# lib/broadcast/dailyPostingAccounts.ts has 0 confirmed posts in the last 24 hours,
+# naming the account, so Workflow Failure Alert opens an issue.
+#
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this holds
+# the scoped ingest database role and the provider key.
+#
+# Secrets (names only):
+#   AIVE_INGEST_DATABASE_URL  scoped aive_ingest role (Supavisor pooler, IPv4)
+#   BLOTATO_API_KEY           GET /v2/posts/:id status reads
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC: status lines and handles only.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Broadcast Publication Reconcile
+
+on:
+  schedule:
+    # Hourly at :41, clear of the :00/:07/:30 publishing slots.
+    - cron: '41 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: broadcast-publication-reconcile
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    # Up to 25 candidates per run, each polled for at most 180 s.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Reconcile publications and check daily posting
+        env:
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          BLOTATO_API_KEY: ${{ secrets.BLOTATO_API_KEY }}
+        run: npm run broadcast:reconcile

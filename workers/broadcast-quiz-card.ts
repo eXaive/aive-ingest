@@ -38,7 +38,7 @@
 
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
-import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending } from '../lib/broadcast/publicationAttempts';
+import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending, stalledAttemptMessage } from '../lib/broadcast/publicationAttempts';
 
 /* Confirmed with the account owner 2026-09-05 before wiring. Both accounts had
    zero posting history and Blotato exposes no display name or bio, so nothing
@@ -346,6 +346,9 @@ async function main(): Promise<void> {
     return;
   }
   if (attempt.state !== 'reserved' || attempt.lease_owner !== leaseOwner) {
+    // Someone else's attempt holds this intent. Fresh: it may still be in flight. Past 6 h: a stall -- fail the run.
+    const stalled = stalledAttemptMessage(attempt);
+    if (stalled) throw new Error(stalled);
     console.log(`[quiz-card] existing attempt state=${attempt.state}; no render or provider submission`);
     return;
   }

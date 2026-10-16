@@ -35,6 +35,7 @@
     "broadcast:kids-distribution": "tsx workers/broadcast-kids-distribution.ts",
     "verify:kids-distribution-worker": "tsx scripts/verify-kids-distribution-worker.ts",
     "verify:reconcile-scope": "tsx scripts/verify-reconcile-scope.ts",
+    "verify:publication-stall": "tsx scripts/verify-publication-stall.ts",
     "verify:insert-conflict-sql": "tsx scripts/verify-insert-conflict-sql.ts",
     "verify:ou1comes-promo-rotation": "tsx scripts/verify-ou1comes-promo-rotation.ts",
     "verify:insert-rows-chunking": "tsx scripts/verify-insert-rows-chunking.ts",

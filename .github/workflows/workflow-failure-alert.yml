@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # Workflow Failure Alert — one notification per failed scheduled-workflow run.
 #
-# WHY workflow_run AND NOT A STEP IN EACH WORKFLOW. The 15 scheduled workflows
+# WHY workflow_run AND NOT A STEP IN EACH WORKFLOW. The 16 scheduled workflows
 # stay byte-for-byte unchanged: no added steps, no `if: failure()` hooks, no new
 # secrets in jobs that publish or write data. A failure anywhere in a run —
 # including a job that never starts — ends as a completed run here.
@@ -40,6 +40,7 @@ on:
       - 'Broadcast Content Production V1'
       - 'Broadcast Daily Post'
       - 'Broadcast Kids Distribution'
+      - 'Broadcast Publication Reconcile'
       - 'Broadcast Quiz Card (Cat)'
       - 'Broadcast Quiz Card (GTA)'
       - 'Broadcast Text Card'
