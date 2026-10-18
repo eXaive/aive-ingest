@@ -16,6 +16,11 @@
  * promo pool; on the other days from the regular pool. Each pool keeps its own
  * queue_position order and loops independently. The text-card worker never
  * uses promo rows.
+ *
+ * NEWS topics ('NEWS:<story_id>', lib/broadcast/newsApproval.ts) belong to NO
+ * pool: neither the promo nor the regular predicate matches them, so no
+ * rotation, fallback or loop-back can pick or revive one. A news row is
+ * published only by an explicit, approved force_topic run.
  */
 
 export const PROMO_TOPIC_PREFIX = 'OU1COMES:';
@@ -32,11 +37,13 @@ export function isPromoDay(now: Date = new Date()): boolean {
   return PROMO_UTC_DAYS.includes(now.getUTCDay());
 }
 
-/* Constant SQL, no caller input. `_` is a LIKE wildcard, so the prefix must not
-   contain one; '%' is appended here. */
+/* Constant SQL, no caller input. `_` is a LIKE wildcard, so the prefixes must
+   not contain one; '%' is appended here. */
 const PROMO_MATCH = `topic_name LIKE '${PROMO_TOPIC_PREFIX}%'`;
+export const NEWS_TOPIC_PREFIX = 'NEWS:';
+const NEWS_MATCH = `topic_name LIKE '${NEWS_TOPIC_PREFIX}%'`;
 
 /** WHERE-clause predicate for one pool of broadcast_topic_queue. */
 export function topicPoolPredicate(promo: boolean): string {
-  return promo ? PROMO_MATCH : `NOT (${PROMO_MATCH})`;
+  return promo ? PROMO_MATCH : `NOT (${PROMO_MATCH}) AND NOT (${NEWS_MATCH})`;
 }

@@ -41,6 +41,7 @@ import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending, stalledAttemptMessage } from '../lib/broadcast/publicationAttempts';
 import { topicPoolPredicate } from '../lib/broadcast/promoRotation';
+import { isNewsTopic } from '../lib/broadcast/newsApproval';
 
 /* mister.mcp.a2a. The other two connected accounts (vice.marshal.kyli,
    wwwsnowbunnymafiacom) are out of scope and must never appear here. */
@@ -300,7 +301,7 @@ async function appPost(path: string, payload: unknown): Promise<Record<string, a
   try { return JSON.parse(body); } catch { throw new Error(`${path} returned unparseable JSON`); }
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const startedAt = Date.now();
 
   if (process.env.BROADCAST_SKIP_TODAY?.trim() === '1') {
@@ -329,6 +330,8 @@ async function main(): Promise<void> {
   const forced = process.env.BROADCAST_FORCE_TOPIC?.trim() || null;
   const topic = await nextTopic(forced);
   if (!topic) throw new Error(forced ? `forced topic not found or skipped: ${forced}` : 'no topic available for a card');
+  // News is video-only and posts only through the approved Daily Post path.
+  if (isNewsTopic(topic.topic_name)) throw new Error('NEWS topics are never text cards');
 
   const slotKey = await nextPublicationSlot('broadcast_topic', topic.id, 'text-card');
   const leaseOwner = crypto.randomUUID();

@@ -49,6 +49,7 @@ import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending, stalledAttemptMessage } from '../lib/broadcast/publicationAttempts';
 import { isPromoDay, topicPoolPredicate } from '../lib/broadcast/promoRotation';
+import { assertNewsPublishable, assertRetryAuthorized, isNewsTopic, loadNewsApproval, verifyNewsMedia } from '../lib/broadcast/newsApproval';
 
 /* mister.mcp.a2a — broadcast_accounts.id. The OTHER TWO CONNECTED ACCOUNTS
    (vice.marshal.kyli, wwwsnowbunnymafiacom) ARE OUT OF SCOPE for this
@@ -87,6 +88,8 @@ function blotatoHeaders(): Record<string, string> {
 interface TopicRow {
   id: string;
   topic_name: string;
+  /** Read for every selection; a news row must still be 'pending' to post. */
+  status: string;
   layer: string;
   evidence_status: string;
   prompt_seed: string;
@@ -110,7 +113,7 @@ interface TopicRow {
 export async function nextTopic(forceName: string | null, now: Date = new Date()): Promise<TopicRow | null> {
   if (forceName) {
     const rows = await q<TopicRow>(
-      `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
+      `SELECT id, topic_name, status, layer, evidence_status, prompt_seed, caption,
               pregenerated_media_url
          FROM broadcast_topic_queue WHERE topic_name = $1 LIMIT 1`,
       [forceName],
@@ -128,7 +131,7 @@ export async function nextTopic(forceName: string | null, now: Date = new Date()
     const pool = topicPoolPredicate(promo);
     const pick = async () =>
       (await q<TopicRow>(
-        `SELECT id, topic_name, layer, evidence_status, prompt_seed, caption,
+        `SELECT id, topic_name, status, layer, evidence_status, prompt_seed, caption,
                 pregenerated_media_url
            FROM broadcast_topic_queue
           WHERE status = 'pending' AND ${pool}
@@ -303,7 +306,22 @@ async function appPost(path: string, payload: unknown): Promise<Record<string, a
   try { return JSON.parse(body); } catch { throw new Error(`${path} returned unparseable JSON`); }
 }
 
-async function main(): Promise<void> {
+/**
+ * A NEWS topic posts once, only from an explicit force_topic run, only with a committed PUBLICATION_AUTHORIZED
+ * approval that binds this row's caption and media URL, and only after the media bytes match the approved SHA-256.
+ * All of it is checked before any capacity claim or provider call. Never generated from a prompt.
+ */
+async function newsGate(topic: TopicRow, forced: boolean): Promise<void> {
+  const approval = loadNewsApproval(topic.topic_name);
+  assertNewsPublishable({ approval, row: topic, accountId: MISTER_MCP_A2A, forced, now: new Date() });
+  const [prior] = await q<{ state: string; failed_at: string | null }>(
+    `SELECT state, failed_at FROM broadcast_publication_attempts WHERE intent_key = $1 LIMIT 1`, [`topic-video:${topic.id}:news-once`]);
+  assertRetryAuthorized(approval, prior ?? null);
+  await verifyNewsMedia(approval);
+  console.log('[broadcast-daily] news approval verified — authorized render, caption and account match');
+}
+
+export async function main(): Promise<void> {
   const startedAt = Date.now();
 
   if (process.env.BROADCAST_SKIP_TODAY?.trim() === '1') {
@@ -321,7 +339,11 @@ async function main(): Promise<void> {
   const forced = process.env.BROADCAST_FORCE_TOPIC?.trim() || null;
   const topic = await nextTopic(forced);
   if (!topic) throw new Error(forced ? `forced topic not found: ${forced}` : 'no topic available');
-  const slotKey = await nextPublicationSlot('broadcast_topic', topic.id, 'daily-video');
+  const news = isNewsTopic(topic.topic_name);
+  if (news) await newsGate(topic, !!forced);
+  /* A news episode has exactly one publication intent: a retry, a re-dispatch or a second force run lands on the
+     same attempt (recovered or blocked), never a new submission. */
+  const slotKey = news ? 'news-once' : await nextPublicationSlot('broadcast_topic', topic.id, 'daily-video');
   const leaseOwner = crypto.randomUUID();
   const intentKey = `topic-video:${topic.id}:${slotKey}`;
   const attempt = await claimPublication({ intentKey, sourceKind: 'broadcast_topic', sourceId: topic.id, purpose: 'daily-video', slotKey, accountId: MISTER_MCP_A2A, leaseOwner, dailyCap: MAX_POSTS_PER_DAY });
@@ -350,6 +372,7 @@ async function main(): Promise<void> {
     mediaUrl = topic.pregenerated_media_url.trim();
     console.log('[broadcast-daily] using pre-rendered video for this topic — generation skipped');
   } else {
+    if (news) throw new Error('news topics never generate from a prompt');
     const creationId = await startGeneration(topic.prompt_seed);
     console.log(`[broadcast-daily] generation started — creation ${creationId}`);
     mediaUrl = await awaitRender(creationId);

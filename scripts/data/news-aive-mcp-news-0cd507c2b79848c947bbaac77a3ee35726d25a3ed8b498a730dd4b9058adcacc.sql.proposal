@@ -1,0 +1,8 @@
+-- NEWS topic row for aive-mcp-news-0cd507c2b79848c947bbaac77a3ee35726d25a3ed8b498a730dd4b9058adcacc — PROPOSAL. Review material only; never run by an agent.
+-- Apply only after the approval file is PUBLICATION_AUTHORIZED, with media_url set to that file's exact media_url.
+-- NEWS rows are in no automatic pool (lib/broadcast/promoRotation.ts); this row posts only via Daily Post force_topic=NEWS:aive-mcp-news-0cd507c2b79848c947bbaac77a3ee35726d25a3ed8b498a730dd4b9058adcacc.
+-- On confirmed publication, confirm_broadcast_publication marks it used and clears pregenerated_media_url, so it can never repost.
+INSERT INTO broadcast_topic_queue (topic_name, layer, evidence_status, prompt_seed, status, queue_position, caption, pregenerated_media_url)
+VALUES ('NEWS:aive-mcp-news-0cd507c2b79848c947bbaac77a3ee35726d25a3ed8b498a730dd4b9058adcacc', 'tools-websites', 'VERIFIED - PRE-RENDERED NEWS', 'PRE-RENDERED NEWS. Never generated from this text.', 'pending', 1001,
+        'One MCP server went from 97 tools to 20. Ticker Scout removed 81 tools and added 4, and its registry version moved from 2.0.0 to 3.0.1. If your AI agent uses one of the removed tools, check the server''s updated tool list. Search MCP servers at outcomes.services #MCP #AIagents #AI', :approved_media_url)
+ON CONFLICT (topic_name) DO NOTHING;

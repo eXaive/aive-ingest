@@ -38,6 +38,7 @@
     "verify:publication-stall": "tsx scripts/verify-publication-stall.ts",
     "verify:insert-conflict-sql": "tsx scripts/verify-insert-conflict-sql.ts",
     "verify:ou1comes-promo-rotation": "tsx scripts/verify-ou1comes-promo-rotation.ts",
+    "verify:news-publication": "tsx scripts/verify-news-publication.ts",
     "verify:insert-rows-chunking": "tsx scripts/verify-insert-rows-chunking.ts",
     "verify:failure-alert": "tsx scripts/verify-failure-alert.ts",
     "verify:watch-evaluation-trigger": "tsx scripts/verify-watch-evaluation-trigger.ts"
