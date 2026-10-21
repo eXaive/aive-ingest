@@ -85,12 +85,26 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Optional distribution prerequisite: never block the existing TikTok path.
+      - name: Prepare FFmpeg for automatic X distribution
+        if: vars.BROADCAST_AUTOMATIC_DISTRIBUTION == '1'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version
+          ffprobe -version
+
       - name: Generate and post
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
           BLOTATO_API_KEY: ${{ secrets.BLOTATO_API_KEY }}
           AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
           AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          BROADCAST_AUTOMATIC_DISTRIBUTION: ${{ vars.BROADCAST_AUTOMATIC_DISTRIBUTION }}
           BROADCAST_SKIP_TODAY: ${{ inputs.skip_today }}
           BROADCAST_FORCE_TOPIC: ${{ inputs.force_topic }}
         run: npx tsx workers/broadcast-daily-post.ts

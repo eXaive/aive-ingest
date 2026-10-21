@@ -45,6 +45,7 @@
  *   BROADCAST_FORCE_TOPIC=<name>  use this topic instead of the queue order
  */
 
+import { captureAutomatic, resumeAutomatic } from '../lib/broadcast/automaticDistribution';
 import { q, endIngestPool } from '../lib/ingest/db';
 import { confirmPublished, submissionIdFor } from '../lib/broadcast/publishConfirm';
 import { claimPublication, nextPublicationSlot, markConfirmationPending, markConfirmed, markConfirmationFailed, touchConfirmationPending, stalledAttemptMessage } from '../lib/broadcast/publicationAttempts';
@@ -331,6 +332,7 @@ export async function main(): Promise<void> {
 
   const standDown = await standDownReason();
   if (standDown) {
+    await resumeAutomatic();
     // Not a failure: the cap did its job. Exit 0 so a double-fire is quiet.
     console.log(`[broadcast-daily] standing down — ${standDown}; nothing sent`);
     return;
@@ -368,12 +370,14 @@ export async function main(): Promise<void> {
      cleared in the same statement that marks the topic used -- because the
      rotation loops and a leftover URL would republish the same video forever. */
   let mediaUrl: string;
+  let automaticCreationId: string | null = null;
   if (topic.pregenerated_media_url?.trim()) {
     mediaUrl = topic.pregenerated_media_url.trim();
     console.log('[broadcast-daily] using pre-rendered video for this topic — generation skipped');
   } else {
     if (news) throw new Error('news topics never generate from a prompt');
     const creationId = await startGeneration(topic.prompt_seed);
+    automaticCreationId = creationId;
     console.log(`[broadcast-daily] generation started — creation ${creationId}`);
     mediaUrl = await awaitRender(creationId);
     console.log('[broadcast-daily] render complete');
@@ -390,6 +394,8 @@ export async function main(): Promise<void> {
   const jobId = staged.job?.id;
   if (!jobId) throw new Error('staging returned no job id');
   console.log(`[broadcast-daily] staged job ${jobId}`);
+
+  await captureAutomatic(jobId, automaticCreationId, automaticCreationId ? { templateId: AI_STORY_TEMPLATE, inputs: {}, prompt: topic.prompt_seed } : undefined);
 
   const dispatched = await appPost('/api/broadcast/dispatch', {
     jobId,
@@ -441,6 +447,7 @@ export async function main(): Promise<void> {
       WHERE id = $1`,
     [topic.id],
   );
+  await resumeAutomatic(jobId);
   console.log(`[broadcast-daily] DONE topic=${topic.topic_name} job=${jobId} elapsed_s=${((Date.now() - startedAt) / 1000).toFixed(0)}`);
 }
 
