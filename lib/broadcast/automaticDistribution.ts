@@ -22,7 +22,10 @@ export async function captureAutomatic(jobId: string, creationId: string | null,
   try { await call({ action: 'capture', jobId, creationId, requestedGeneration }); }
   catch { console.log('[automatic-distribution] capture blocked; TikTok unchanged; inspect owner status'); }
 }
-async function xExport(video: any) {
+/** Standing policy currently valid: enabled, not revoked, and permanent (expires_at null) or not yet expired. */
+export const policyLive = (p: any, now = Date.now()) => p.enabled && !p.revoked_at && (p.expires_at === null || Date.parse(p.expires_at) > now);
+/** X portrait 720p derivative of an exact Blotato-hosted source (also used by the category-introduction worker). */
+export async function xExport(video: { mediaUrl: string; sourceSha256: string }) {
   const url = new URL(video.mediaUrl);
   if (url.protocol !== 'https:' || url.hostname !== 'database.blotato.io' || url.username || url.password || url.port) throw Error('x_source_origin_invalid');
   const ffmpeg = process.env.AIVE_SHORTS_FFMPEG || '/usr/bin/ffmpeg';
@@ -72,9 +75,9 @@ export async function resumeAutomatic(onlyJob?: string) {
         try { await call({ action: 'reconcile', jobId: delivery.job_id }); } catch { console.log('[automatic-distribution] receipt pending; no resubmission'); }
       }
     }
-    if (!state.policies.some((p: any) => p.enabled && !p.revoked_at && Date.parse(p.expires_at) > Date.now())) return;
+    if (!state.policies.some((p: any) => policyLive(p))) return;
     const videos = state.videos.filter((v: any) => !v.blocked && (!onlyJob || v.sourceJob === onlyJob)
-      && state.policies.some((p: any) => p.id === v.policyId && p.enabled && !p.revoked_at && Date.parse(p.expires_at) > Date.now())
+      && state.policies.some((p: any) => p.id === v.policyId && policyLive(p))
       && state.deliveries.filter((d: any) => d.source_job === v.sourceJob).length < 3).slice(0, 3);
     for (const video of videos) for (const platform of ['linkedin', 'instagram', 'twitter']) {
       if (state.deliveries.some((d: any) => d.source_job === video.sourceJob && d.platform === platform)) continue;

@@ -55,7 +55,7 @@ name: Broadcast Text Card
 on:
   schedule:
     - cron: '0 10 * * *'
-    - cron: '0 19 * * *'
+    # 19:00 UTC slot now carries the OU1COMES category introduction (broadcast-intro-distribution.yml).
   workflow_dispatch:
     inputs:
       skip_today:

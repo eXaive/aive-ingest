@@ -39,6 +39,7 @@ on:
     workflows:
       - 'Broadcast Content Production V1'
       - 'Broadcast Daily Post'
+      - 'Broadcast Intro Distribution'
       - 'Broadcast Kids Distribution'
       - 'Broadcast Publication Reconcile'
       - 'Broadcast Quiz Card (Cat)'
