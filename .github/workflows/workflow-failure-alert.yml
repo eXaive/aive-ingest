@@ -54,6 +54,7 @@ on:
       - 'Ingest Watchdog'
       - 'Webhook Providers Ingest'
       - 'MCP Endpoint Probes'
+      - 'Publishing Calendar'
     types: [completed]
 
 permissions:

@@ -1,0 +1,57 @@
+# ═════════════════════════════════════════════════
+# Publishing Calendar — hourly trigger for owner-approved article publication.
+#
+# The owner approves a weekly batch once in AIVE (aive.global/owner/publishing). Each run asks the app to publish any
+# approved draft whose window is open (09:00 America/New_York on its date to the end of the next day). The app holds
+# the approvals, provider credentials and all safety rules: no early or late publication, no publication while
+# paused or after revocation/expiry, one attempt per item, uncertain outcomes block the platform until the owner
+# reconciles. Running hourly is what lets a late or skipped scheduler run catch up inside the window.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints platform names, outcome codes and counts only.
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this workflow holds the app's machine secret.
+#
+# Required repo secrets (already present for the Broadcast workflows):
+#   AIVE_CRON_SECRET  Bearer accepted by /api/publishing/calendar/run (and nothing owner-interactive)
+#   AIVE_BASE_URL     deployed app origin, e.g. https://aive.global (a SECRET, not a variable)
+# Kill switches: pause in AIVE (stops every write), or disable this workflow.
+# ═════════════════════════════════════════════════
+name: Publishing Calendar
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: compute what is due and precheck it, write nothing (1 = dry run)'
+        required: false
+        default: ''
+
+concurrency:
+  # Never two runs at once; the app's database reservation is the real guarantee.
+  group: publishing-calendar
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the publishing calendar
+        env:
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          CALENDAR_DRY_RUN: ${{ inputs.dry_run }}
+        run: npx tsx workers/publishing-calendar.ts
