@@ -7,11 +7,6 @@
 # paused or after revocation/expiry, one attempt per item, uncertain outcomes block the platform until the owner
 # reconciles. Running hourly is what lets a late or skipped scheduler run catch up inside the window.
 #
-# Before the calendar run, the autopilot step asks AIVE to advance its evidence-first article pipeline under the owner's
-# standing policy (plan, gather evidence, write, verify, draft, schedule). Articles that pass every check become
-# one-item calendar batches that the calendar step then publishes in their windows. The calendar step runs even if the
-# autopilot step fails, so publication never depends on generation.
-#
 # THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints platform names, outcome codes and counts only.
 # Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this workflow holds the app's machine secret.
 #
@@ -23,6 +18,12 @@
 # After the calendar run, a read-only step checks AIVE's PRIMARY trigger (Supabase pg_cron at :08, calling the same run
 # endpoint) and turns this run red when it needs attention, so the Workflow Failure Alert reports it. Best effort: it
 # runs only when GitHub runs this workflow, which for this repository is unreliable (hours late, often skipped).
+#
+# Last, the autopilot step asks AIVE to advance its evidence-first article pipeline under the owner's standing policy
+# (plan, gather evidence, write, verify, draft, schedule). Articles that pass every check become one-item calendar
+# batches that a later calendar run publishes in their windows. The calendar step runs first, so publication never
+# waits for generation, and the trigger check runs before the slow autopilot step so a job timeout cannot skip it;
+# each step runs even if an earlier one fails.
 # ═════════════════════════════════════════════════
 name: Publishing Calendar
 
@@ -58,15 +59,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run the publishing autopilot
-        env:
-          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
-          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
-          AUTOPILOT_DRY_RUN: ${{ inputs.dry_run }}
-        run: npx tsx workers/publishing-autopilot.ts
-
       - name: Run the publishing calendar
-        if: ${{ !cancelled() }}
         env:
           AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
           AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
@@ -79,3 +72,11 @@ jobs:
           AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
           AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
         run: npx tsx workers/publishing-calendar-trigger-health.ts
+
+      - name: Run the publishing autopilot
+        if: ${{ !cancelled() }}
+        env:
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          AUTOPILOT_DRY_RUN: ${{ inputs.dry_run }}
+        run: npx tsx workers/publishing-autopilot.ts

@@ -39,6 +39,8 @@ assert.equal(summarizeAutopilot(200, { planned: 0, stages: [], attention: false 
 assert.equal(summarizeAutopilot(200, { dryRun: true, paused: true, counts: { SCHEDULED: 2, 'bad key <x>': 1 }, attention: false }).lines[0], 'publishing-autopilot: dry run paused=true SCHEDULED=2');
 assert.equal(summarizeAutopilot(500, { error: 'autopilot_tick_failed', attention: true }).exitCode, 1);
 assert.match(workflow, /run: npx tsx workers\/publishing-autopilot\.ts/);
-assert.ok(workflow.indexOf('publishing-autopilot.ts') < workflow.indexOf('publishing-calendar.ts'), 'autopilot runs before the calendar step');
-assert.match(workflow, /- name: Run the publishing calendar\r?\n\s+if: \$\{\{ !cancelled\(\) \}\}/, 'the calendar step runs even if the autopilot step fails');
-console.log('verify-publishing-calendar-worker: OK (17 checks)');
+assert.ok(workflow.indexOf('workers/publishing-calendar.ts') < workflow.indexOf('workers/publishing-autopilot.ts'), 'the calendar step runs first: publication never waits for generation');
+assert.ok(workflow.indexOf('workers/publishing-calendar-trigger-health.ts') < workflow.indexOf('workers/publishing-autopilot.ts'), 'the trigger check runs before the slow autopilot step, so a job timeout cannot skip it');
+assert.match(workflow, /- name: Run the publishing autopilot\r?\n\s+if: \$\{\{ !cancelled\(\) \}\}/, 'the autopilot step runs even if the calendar step fails');
+assert.ok(!/- name: Run the publishing calendar\r?\n\s+if:/.test(workflow), 'the calendar step is unconditional');
+console.log('verify-publishing-calendar-worker: OK (18 checks)');
