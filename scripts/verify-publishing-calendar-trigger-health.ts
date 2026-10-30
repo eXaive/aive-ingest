@@ -50,4 +50,14 @@ const step = wf.slice(chk, wf.indexOf('run: npx tsx workers/publishing-calendar-
 assert.match(step, /if: \$\{\{ !cancelled\(\) \}\}/); assert.match(step, /AIVE_CRON_SECRET: \$\{\{ secrets\.AIVE_CRON_SECRET \}\}/); assert.ok(!/DRY_RUN/.test(step)); checks++;
 assert.ok(readFileSync('workers/publishing-calendar-trigger-health.ts', 'utf8').includes("trigger-health`, { headers:"), 'GET, no method override'); checks++;
 assert.ok(readFileSync('.github/workflows/workflow-failure-alert.yml', 'utf8').includes("- 'Publishing Calendar'"), 'failure alert covers the workflow'); checks++;
+// The autopilot tick trigger: same contract, its own label in the public log.
+const ap = summarize(200, h('ATTENTION', true), 'autopilot');
+assert.equal(ap.exitCode, 1); assert.match(ap.lines[0], /^publishing-autopilot-trigger: verdict=ATTENTION alert=YES/); checks++;
+assert.equal(summarize(200, h('NOT_ACTIVATED', false), 'autopilot').exitCode, 0); assert.equal(summarize(404, null, 'autopilot').exitCode, 0); checks++;
+assert.match(summarize(200, h('OK', false)).lines[0], /^publishing-calendar-trigger: /, 'calendar label unchanged by default'); checks++;
+const apStep = wf.indexOf('- name: Check the autopilot database trigger (read-only)'), apRun = wf.indexOf('- name: Run the publishing autopilot');
+assert.ok(apStep > chk && apStep < apRun, 'autopilot trigger check after the calendar trigger check, before the slow autopilot step'); checks++;
+const apBlock = wf.slice(apStep, wf.indexOf('run: npx tsx workers/publishing-calendar-trigger-health.ts', apStep) + 70);
+assert.match(apBlock, /if: \$\{\{ !cancelled\(\) \}\}/); assert.match(apBlock, /TRIGGER: autopilot/); assert.ok(!/DRY_RUN/.test(apBlock)); checks++;
+assert.ok(readFileSync('workers/publishing-calendar-trigger-health.ts', 'utf8').includes('/api/publishing/${trigger}/trigger-health'), 'path from TRIGGER'); checks++;
 console.log(`verify-publishing-calendar-trigger-health: OK (${checks} checks)`);

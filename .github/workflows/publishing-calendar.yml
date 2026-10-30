@@ -18,6 +18,7 @@
 # After the calendar run, a read-only step checks AIVE's PRIMARY trigger (Supabase pg_cron at :08, calling the same run
 # endpoint) and turns this run red when it needs attention, so the Workflow Failure Alert reports it. Best effort: it
 # runs only when GitHub runs this workflow, which for this repository is unreliable (hours late, often skipped).
+# A second read-only step does the same for the autopilot tick's database trigger (pg_cron at :38).
 #
 # Last, the autopilot step asks AIVE to advance its evidence-first article pipeline under the owner's standing policy
 # (plan, gather evidence, write, verify, draft, schedule). Articles that pass every check become one-item calendar
@@ -71,6 +72,14 @@ jobs:
         env:
           AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
           AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+        run: npx tsx workers/publishing-calendar-trigger-health.ts
+
+      - name: Check the autopilot database trigger (read-only)
+        if: ${{ !cancelled() }}
+        env:
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+          TRIGGER: autopilot
         run: npx tsx workers/publishing-calendar-trigger-health.ts
 
       - name: Run the publishing autopilot
