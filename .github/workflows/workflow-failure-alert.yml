@@ -55,6 +55,7 @@ on:
       - 'Webhook Providers Ingest'
       - 'MCP Endpoint Probes'
       - 'Publishing Calendar'
+      - 'Publishing Monitor'
     types: [completed]
 
 permissions:

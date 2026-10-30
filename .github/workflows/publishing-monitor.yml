@@ -1,0 +1,51 @@
+# ═════════════════════════════════════════════════
+# Publishing Monitor — persistent, read-only production monitoring for AIVE publishing (calendar executor + autopilot).
+#
+# Each run asks aive.global/api/publishing/monitor for an assessment and fails when it reports an actionable problem, so
+# the Workflow Failure Alert opens one issue (later failures are comments on it). The endpoint only reads: no provider
+# call, no model call, no publication, no write. Spend at $5 and owner pauses are warnings (logged, not failures).
+# Missed database-scheduler runs are detected by the triggers' own health (NOT_RUNNING after 90 min, STALE after 130 min).
+#
+# GitHub runs this repository's schedules unreliably (about 4–5 of 24 hourly slots a day, gaps up to ~8 h): this is the
+# alerting path that works with no Claude session open, not a real-time pager.
+#
+# THIS REPO IS PUBLIC, SO THESE LOGS ARE PUBLIC. The worker prints verdicts, codes, platforms, dates and amounts only.
+# Triggers: schedule + workflow_dispatch ONLY. Never pull_request — this workflow holds the app's machine secret.
+# Required repo secrets (already present): AIVE_CRON_SECRET, AIVE_BASE_URL.
+# ═════════════════════════════════════════════════
+name: Publishing Monitor
+
+on:
+  schedule:
+    - cron: '52 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: publishing-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Assess publishing (read-only)
+        env:
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+        run: npx tsx workers/publishing-monitor.ts
