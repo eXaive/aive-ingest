@@ -38,6 +38,7 @@
     "verify:publication-stall": "tsx scripts/verify-publication-stall.ts",
     "publishing:calendar": "tsx workers/publishing-calendar.ts",
     "verify:publishing-calendar-worker": "tsx scripts/verify-publishing-calendar-worker.ts",
+    "verify:publishing-calendar-trigger-health": "tsx scripts/verify-publishing-calendar-trigger-health.ts",
     "verify:insert-conflict-sql": "tsx scripts/verify-insert-conflict-sql.ts",
     "verify:ou1comes-promo-rotation": "tsx scripts/verify-ou1comes-promo-rotation.ts",
     "verify:news-publication": "tsx scripts/verify-news-publication.ts",

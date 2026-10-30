@@ -76,6 +76,8 @@ jobs:
         run: npm run verify:publication-stall
       - name: verify:publishing-calendar-worker
         run: npm run verify:publishing-calendar-worker
+      - name: verify:publishing-calendar-trigger-health
+        run: npm run verify:publishing-calendar-trigger-health
       - name: verify:probe-run-evidence
         run: npm run verify:probe-run-evidence
       - name: verify:mcp-registry-outcome

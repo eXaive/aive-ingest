@@ -14,6 +14,10 @@
 #   AIVE_CRON_SECRET  Bearer accepted by /api/publishing/calendar/run (and nothing owner-interactive)
 #   AIVE_BASE_URL     deployed app origin, e.g. https://aive.global (a SECRET, not a variable)
 # Kill switches: pause in AIVE (stops every write), or disable this workflow.
+#
+# After the calendar run, a read-only step checks AIVE's PRIMARY trigger (Supabase pg_cron at :08, calling the same run
+# endpoint) and turns this run red when it needs attention, so the Workflow Failure Alert reports it. Best effort: it
+# runs only when GitHub runs this workflow, which for this repository is unreliable (hours late, often skipped).
 # ═════════════════════════════════════════════════
 name: Publishing Calendar
 
@@ -55,3 +59,10 @@ jobs:
           AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
           CALENDAR_DRY_RUN: ${{ inputs.dry_run }}
         run: npx tsx workers/publishing-calendar.ts
+
+      - name: Check the database trigger (read-only)
+        if: ${{ !cancelled() }}
+        env:
+          AIVE_CRON_SECRET: ${{ secrets.AIVE_CRON_SECRET }}
+          AIVE_BASE_URL: ${{ secrets.AIVE_BASE_URL }}
+        run: npx tsx workers/publishing-calendar-trigger-health.ts
