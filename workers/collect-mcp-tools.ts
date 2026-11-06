@@ -50,7 +50,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { q, ingestPool, endIngestPool, logIngestionPg, PG_MAX_BIND_PARAMS } from '../lib/ingest/db';
+import { q, ingestPool, endIngestPool, logIngestionPg, PG_MAX_BIND_PARAMS, connectWithRetry } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
 // Operator opt-outs, SHARED with discover-mcp-servers.ts. Not a second copy of
 // the matching rules: this worker's dispatch loop already restates runSweep's
@@ -59,6 +59,7 @@ import { parseLimit } from '../lib/ingest/parseLimit';
 // collector while still dialling from the other.
 import { loadExclusions, isExcluded, exclusionNote } from '../lib/mcp/exclusions';
 import { classifyException, classifyStatus, parseRetryAfter } from '../lib/mcp/errorClass';
+import { guardedFetch, SsrfBlockedError } from '../lib/net/ssrfGuard';
 import {
   schemaHash, contractHash, paramSet, paramCount, requiredCount, maxDepth,
   falseDriftClasses, tallyFalseDrift, tokenEstimate,
@@ -403,14 +404,19 @@ export async function collectOnce(item: Item): Promise<{ capture: CaptureRow; re
 
     let res: Response;
     try {
-      res = await fetch(parsed.href, {
+      // Guarded: every hop's address is checked and redirects are followed manually (SSRF, 2026-11-06).
+      res = await guardedFetch(parsed.href, {
         method: 'POST',
-        redirect: 'follow',
         signal: AbortSignal.timeout(TIMEOUT_MS),
         headers: toolsHeaders(),
         body: toolsBody(cursor),
       });
     } catch (err) {
+      // SSRF guard (lib/net/ssrfGuard.ts): hop 0 means the host itself is refused and NO request was made.
+      if (err instanceof SsrfBlockedError && err.hop === 0 && pageCount === 0) {
+        notes.push(err.message);
+        return { capture: finish({ status: 'not_attempted', error_class: 'other' }), retryAfterMs: null };
+      }
       const { cls, raw } = classifyException(err);
       if (cls === 'other') notes.push(raw.slice(0, 200));
       return {
@@ -616,7 +622,8 @@ export async function persistCaptureAtomically(
   c: CaptureRow,
   toolCollectionRunId: string,
   compatibilityScanRunId: string,
-  acquire: () => Promise<TransactionClient> = () => ingestPool().connect() as Promise<TransactionClient>,
+  // connectWithRetry: a connection-limit refusal (53300, raised before BEGIN) is retried, never a partial write.
+  acquire: () => Promise<TransactionClient> = () => connectWithRetry('tool capture transaction') as Promise<TransactionClient>,
 ): Promise<string> {
   const client = await acquire();
   try {

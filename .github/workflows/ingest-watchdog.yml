@@ -64,6 +64,13 @@ concurrency:
 
 jobs:
   watch:
+    # SHARED DATABASE LANE (2026-11-06). Every aive-ingest workflow that writes as aive_ingest (CONNECTION LIMIT 4)
+    # runs this job in ONE group, so at most one ingest job holds connections at a time (pool <= 2, lib/ingest/db.ts).
+    # The broadcast workflows use pool 1 instead (they keep their own groups). Replay of 14 days of real runs:
+    # 0 cancelled runs, <= 36 min queueing, peak 3 connections. Contract: scripts/verify-connection-topology.ts.
+    concurrency:
+      group: aive-ingest-db
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Four bounded queries. If this is still running at 10 minutes the database
     # is the problem, which is itself worth a red run.
@@ -87,4 +94,7 @@ jobs:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
           WATCHDOG_GAP_HOURS: ${{ inputs.gap_hours }}
           WATCHDOG_CONSECUTIVE_FAILURES: ${{ inputs.consecutive_failures }}
+          # Empty (default) = change-ledger check reports only. Owner sets the repo variable to 'enforce'
+          # when the change detector is enabled (see workers/ingest-watchdog.ts header).
+          WATCHDOG_CHANGE_LEDGER: ${{ vars.WATCHDOG_CHANGE_LEDGER }}
         run: npx tsx workers/ingest-watchdog.ts

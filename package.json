@@ -26,6 +26,10 @@
     "verify:registry-retry": "tsx scripts/verify-registry-retry.ts",
     "verify:watchdog-onset": "tsx scripts/verify-watchdog-onset.ts",
     "verify:registry-checkpoint": "tsx scripts/verify-registry-checkpoint.ts",
+    "verify:watchdog-checks": "tsx scripts/verify-watchdog-checks.ts",
+    "verify:ssrf-guard": "tsx scripts/verify-ssrf-guard.ts",
+    "verify:connection-budget": "tsx scripts/verify-connection-budget.ts",
+    "verify:connection-topology": "tsx scripts/verify-connection-topology.ts",
     "verify:probe-run-evidence": "tsx scripts/verify-probe-run-evidence.ts",
     "verify:tool-collection-evidence": "tsx scripts/verify-tool-collection-evidence.ts",
     "watchdog": "tsx workers/ingest-watchdog.ts",
@@ -45,7 +49,9 @@
     "verify:news-publication": "tsx scripts/verify-news-publication.ts",
     "verify:insert-rows-chunking": "tsx scripts/verify-insert-rows-chunking.ts",
     "verify:failure-alert": "tsx scripts/verify-failure-alert.ts",
-    "verify:watch-evaluation-trigger": "tsx scripts/verify-watch-evaluation-trigger.ts"
+    "verify:watch-evaluation-trigger": "tsx scripts/verify-watch-evaluation-trigger.ts",
+    "verify:protocol-watch": "tsx scripts/verify-protocol-watch.ts",
+    "watch:protocols": "tsx workers/protocol-watch.ts"
   },
   "dependencies": {
     "pg": "^8.22.0"

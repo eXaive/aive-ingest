@@ -60,5 +60,6 @@ jobs:
       - name: Reconcile publications and check daily posting
         env:
           AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          AIVE_INGEST_POOL_MAX: '1' # one connection; the ingest lane holds the other slots (lib/ingest/db.ts)
           BLOTATO_API_KEY: ${{ secrets.BLOTATO_API_KEY }}
         run: npm run broadcast:reconcile

@@ -33,6 +33,13 @@ concurrency:
 
 jobs:
   ingest:
+    # SHARED DATABASE LANE (2026-11-06). Every aive-ingest workflow that writes as aive_ingest (CONNECTION LIMIT 4)
+    # runs this job in ONE group, so at most one ingest job holds connections at a time (pool <= 2, lib/ingest/db.ts).
+    # The broadcast workflows use pool 1 instead (they keep their own groups). Replay of 14 days of real runs:
+    # 0 cancelled runs, <= 36 min queueing, peak 3 connections. Contract: scripts/verify-connection-topology.ts.
+    concurrency:
+      group: aive-ingest-db
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

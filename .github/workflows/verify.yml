@@ -90,6 +90,16 @@ jobs:
         run: npm run verify:watchdog-onset
       - name: verify:registry-checkpoint
         run: npm run verify:registry-checkpoint
+      - name: verify:watchdog-checks
+        run: npm run verify:watchdog-checks
+      - name: verify:ssrf-guard
+        run: npm run verify:ssrf-guard
+      - name: verify:connection-budget
+        run: npm run verify:connection-budget
+      - name: verify:connection-topology
+        run: npm run verify:connection-topology
+      - name: verify:protocol-watch
+        run: npm run verify:protocol-watch
       - name: verify:tool-collection-evidence
         run: npm run verify:tool-collection-evidence
       - name: verify:list-collectors

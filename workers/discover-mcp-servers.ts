@@ -98,13 +98,14 @@
  * for smoke tests; unset = full corpus), DISCOVER_CONCURRENCY (default 8).
  */
 
-import { q, ingestPool, insertRows, endIngestPool, logIngestionPg } from '../lib/ingest/db';
+import { q, ingestPool, insertRows, endIngestPool, logIngestionPg, withConnectionLimitRetry } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
 // Operator opt-outs. The matching logic is SHARED with collect-mcp-tools.ts and
 // lives in one module on purpose: an opt-out honoured by one collector and missed
 // by the other is worse than no mechanism, because the operator was told it was
 // handled. See the header of lib/mcp/exclusions.ts.
 import { loadExclusions, isExcluded, exclusionNote } from '../lib/mcp/exclusions';
+import { guardedFetch, SsrfBlockedError } from '../lib/net/ssrfGuard';
 import {
   classifyException, classifyStatus, parseRetryAfter, type ErrorClass,
 } from '../lib/mcp/errorClass';
@@ -762,14 +763,19 @@ export async function discoverOnce(
   const t0 = Date.now();
   let res: Response;
   try {
-    res = await fetch(parsed.href, {
+    // Guarded: every hop's address is checked and redirects are followed manually (SSRF, 2026-11-06).
+    res = await guardedFetch(parsed.href, {
       method: 'POST',
-      redirect: 'follow',
       signal: AbortSignal.timeout(TIMEOUT_MS),
       headers: discoverHeaders(),
       body: DISCOVER_BODY,
     });
   } catch (err) {
+    // Hop 0 refused: the host itself is not contactable and NO request was made.
+    if (err instanceof SsrfBlockedError && err.hop === 0) {
+      notes.push(err.message);
+      return { kind: 'row', row: finish({ error_class: 'other', discover_status: 'not_attempted', probe_method: null }) };
+    }
     const { cls, tls, raw } = classifyException(err);
     if (cls === 'other') notes.push(raw.slice(0, 200));
     return {
@@ -1145,7 +1151,8 @@ export async function discoverMcpServers(): Promise<{
     const chunk = pending;
     pending = [];
     try {
-      await insertRows('mcp_endpoint_probes', COLS, chunk.map((r) => [
+      // 53300 is refused at connect, before the INSERT runs, so the retry cannot duplicate rows.
+      await withConnectionLimitRetry(() => insertRows('mcp_endpoint_probes', COLS, chunk.map((r) => [
         r.server_id, r.endpoint_url, r.probed_at, r.http_status, r.response_time_ms,
         r.error_class, r.tls_valid, r.note, r.probe_method, r.content_type,
         // text[] goes through node-pg as a JS array (it maps to a Postgres
@@ -1156,7 +1163,7 @@ export async function discoverMcpServers(): Promise<{
         r.discover_status,
         r.discover_raw === null || r.discover_raw === undefined ? null : JSON.stringify(r.discover_raw),
         'PROTOCOL_DISCOVERY',
-      ]));
+      ])), 'discover insert chunk');
       written += chunk.length;
     } catch (err) {
       errors++;

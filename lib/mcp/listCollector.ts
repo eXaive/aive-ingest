@@ -31,10 +31,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { q, ingestPool, insertRows, logIngestionPg } from '../ingest/db';
+import { q, ingestPool, insertRows, logIngestionPg, withConnectionLimitRetry } from '../ingest/db';
 import { parseLimit } from '../ingest/parseLimit';
 import { loadExclusions, isExcluded, exclusionNote, type Method } from './exclusions';
 import { classifyException, classifyStatus, parseRetryAfter } from './errorClass';
+import { guardedFetch, SsrfBlockedError } from '../net/ssrfGuard';
 // HostScheduler and Item are imported and used UNMODIFIED. Nothing in
 // discover-mcp-servers.ts is changed by this module.
 import { HostScheduler, type Item } from '../../workers/discover-mcp-servers';
@@ -242,14 +243,19 @@ export async function collectOnce(
 
     let res: Response;
     try {
-      res = await fetchImpl(parsed.href, {
+      // Guarded: every hop's address is checked and redirects are followed manually (SSRF, 2026-11-06).
+      res = await guardedFetch(parsed.href, {
         method: 'POST',
-        redirect: 'follow',
         signal: AbortSignal.timeout(TIMEOUT_MS),
         headers: listHeaders(spec),
         body: listBody(spec, cursor),
-      });
+      }, fetchImpl);
     } catch (err) {
+      // SSRF guard (lib/net/ssrfGuard.ts): hop 0 means the host itself is refused and NO request was made.
+      if (err instanceof SsrfBlockedError && err.hop === 0 && pageCount === 0) {
+        notes.push(err.message);
+        return { capture: finish({ status: 'not_attempted', error_class: 'other' }), retryAfterMs: null };
+      }
       const { cls, raw } = classifyException(err);
       if (cls === 'other') notes.push(raw.slice(0, 200));
       return {
@@ -550,10 +556,11 @@ export async function runListCollector(spec: ListSpec): Promise<RunResult> {
         const captureId = inserted[0]?.id;
         if (captureId && c.items.length > 0) {
           const cols = ['capture_id', 'server_id', 'endpoint_url', ...spec.itemColumns];
-          await insertRows(spec.itemTable, cols, c.items.map((it) => [
+          // 53300 is refused at connect, before the INSERT runs, so the retry cannot duplicate items.
+          await withConnectionLimitRetry(() => insertRows(spec.itemTable, cols, c.items.map((it) => [
             captureId, c.server_id, c.endpoint_url,
             ...spec.itemColumns.map((col) => bind(col, it[col])),
-          ]));
+          ])), `${spec.tag} items`);
           itemsWritten += c.items.length;
         }
       } catch (err) {

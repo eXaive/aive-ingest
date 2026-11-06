@@ -31,9 +31,62 @@
  * reached from `npx tsx workers/...` where "@/" aliases don't apply.
  */
 
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 
 let pool: Pool | null = null;
+
+/* CONNECTION BUDGET (2026-11-06, MCP audit 2026-11-05). aive_ingest has CONNECTION LIMIT 4 for the whole role,
+   shared by every worker. Each process used to open a pool of 4, so ANY two overlapping jobs could ask for 8, and
+   GitHub's ~8h schedule drift makes overlap routine: on 2026-11-05 the probe sweep (15:14-16:28Z) and the tools/list
+   collection (16:13-16:25Z) overlapped and 12 tool captures were lost to SQLSTATE 53300. Two changes:
+     1. Each process defaults to HALF the role limit, so two concurrent jobs fit. AIVE_INGEST_POOL_MAX overrides
+        (an integer from 1 to ROLE_CONNECTION_LIMIT; anything else falls back to the default, with a warning).
+     2. A connection-limit refusal is retried with backoff. 53300 is raised while CONNECTING, before any statement
+        runs, so a retry can never duplicate a write. Any other error is never retried here. */
+export const ROLE_CONNECTION_LIMIT = 4;
+export const DEFAULT_POOL_MAX = 2;
+export const CONNECTION_LIMIT_RETRY_MS: readonly number[] = [5_000, 15_000, 45_000, 120_000];
+
+/** Pool size for this process from AIVE_INGEST_POOL_MAX. Pure; exported for the verifier. */
+export function poolMaxFrom(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_POOL_MAX;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > ROLE_CONNECTION_LIMIT) {
+    console.warn(`[ingest-db] AIVE_INGEST_POOL_MAX=${JSON.stringify(raw)} is not an integer 1-${ROLE_CONNECTION_LIMIT}; using ${DEFAULT_POOL_MAX}`);
+    return DEFAULT_POOL_MAX;
+  }
+  return n;
+}
+
+/** SQLSTATE 53300 too_many_connections (Postgres) or the same refusal surfaced by text. */
+export function isConnectionLimitError(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  if (e?.code === '53300') return true;
+  return typeof e?.message === 'string' && /too many connections for role|remaining connection slots are reserved/i.test(e.message);
+}
+
+/** Run fn, retrying ONLY connection-limit refusals with CONNECTION_LIMIT_RETRY_MS backoff (~3 min), then rethrow. */
+export async function withConnectionLimitRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!isConnectionLimitError(err) || attempt >= CONNECTION_LIMIT_RETRY_MS.length) throw err;
+      const wait = CONNECTION_LIMIT_RETRY_MS[attempt];
+      console.warn(`[ingest-db] ${label}: role connection limit reached; retry ${attempt + 1}/${CONNECTION_LIMIT_RETRY_MS.length} in ${wait / 1000}s`);
+      await sleep(wait);
+    }
+  }
+}
+
+/** Check out one client for a transaction, retrying connection-limit refusals. */
+export function connectWithRetry(label = 'connect'): Promise<PoolClient> {
+  return withConnectionLimitRetry(() => ingestPool().connect(), label);
+}
 
 export function ingestPool(): Pool {
   if (!pool) {
@@ -45,7 +98,7 @@ export function ingestPool(): Pool {
     u.search = ''; // TLS handled explicitly; see header
     pool = new Pool({
       connectionString: u.toString(),
-      max: 4, // matches the role's CONNECTION LIMIT
+      max: poolMaxFrom(process.env.AIVE_INGEST_POOL_MAX), // half the role's CONNECTION LIMIT by default; see CONNECTION BUDGET
       ssl: { rejectUnauthorized: false },
       connectionTimeoutMillis: 20_000,
     });
@@ -55,7 +108,7 @@ export function ingestPool(): Pool {
 
 /** Parameterized query returning rows. */
 export async function q<T = Record<string, unknown>>(text: string, params?: unknown[]): Promise<T[]> {
-  const res = await ingestPool().query(text, params);
+  const res = await withConnectionLimitRetry(() => ingestPool().query(text, params), 'query');
   return res.rows as T[];
 }
 

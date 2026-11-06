@@ -19,9 +19,18 @@
  *     idempotently, watermark advancing to run start minus DELTA_LOOKBACK_MS
  *     on completion. NOT the steady state (reverted 2026-09-16 — see below).
  *     Kept fully working as something an operator can hand-flip a checkpoint
- *     row into (to exercise the path, or if a real need for it returns), and
- *     as the target of the oversized-changeset fallback below, but nothing in
- *     normal daily operation enters it.
+ *     row into (to exercise the path, or if a real need for it returns), but
+ *     nothing in normal daily operation enters it, and since 2026-11-06 it
+ *     only RUNS under an explicit operator pin: MCP_REGISTRY_DELTA_PIN_UNTIL
+ *     (ISO time, at most DELTA_PIN_MAX_DAYS ahead). Without a valid, unexpired
+ *     pin a delta checkpoint re-arms to a full walk (decideRunPhase).
+ *
+ * WHY A PIN (MCP audit 2026-11-05). The 2026-09-15 pass flipped the live
+ *     checkpoint to delta at 06:23Z, about 33 minutes before the revert
+ *     below landed. The revert stopped NEW flips but nothing moved the
+ *     existing row back, so the walk ran delta-only for 51 days:
+ *     last_full_pass_at stayed 2026-09-15 and last_seen went stale for most
+ *     of the corpus while every run reported success.
  *
  * WHY CHECKPOINTED (run 34832547013, 2026-09-14). The daily full walk had
  * grown to 700+ pages (~70k entries) while the registry slowed to ~2-4.5 s/
@@ -986,12 +995,24 @@ export interface RunOptions {
   refreshCaches?: () => Promise<CacheRefreshBundle>;
   /** Test-only override for DURATION_WARNING_MS; production never sets this. */
   durationWarningThresholdMs?: number;
+  /** Operator delta pin (ISO timestamp). undefined = read MCP_REGISTRY_DELTA_PIN_UNTIL; null = no pin. See decideRunPhase. */
+  deltaPinUntil?: string | null;
+  /** Freshness pre-pass in backfill runs (default on). false only in tests that isolate the walk. */
+  freshnessDelta?: boolean;
+  /** Budget for the freshness pre-pass (default FRESHNESS_BUDGET_MS). */
+  freshnessBudgetMs?: number;
 }
 
 export interface RunResult extends RegistryOutcome {
   run_started_at: string;
   phase_before: Phase;
   phase_after: Phase;
+  /** Phase stored in the checkpoint when the run started, and why the run used phase_before (decideRunPhase). */
+  checkpoint_phase: Phase;
+  phase_decision: PhaseDecisionReason;
+  /** Freshness pre-pass outcome in a backfill run (null when it did not run). */
+  freshness_stop: StopReason | null;
+  freshness_pages: number;
   stop: StopReason;
   stop_detail: string | null;
   pages: number;
@@ -1010,6 +1031,39 @@ export interface RunResult extends RegistryOutcome {
   total_elapsed_ms: number;
   duration_warning: boolean;
   duration_warning_threshold_ms: number;
+}
+
+/** Environment variable an operator sets (on the workflow) to keep the walk in delta mode until an ISO time. */
+export const DELTA_PIN_ENV = 'MCP_REGISTRY_DELTA_PIN_UNTIL';
+/** Longest pin accepted: a pin is a short operational override, never a silent new steady state. */
+export const DELTA_PIN_MAX_DAYS = 7;
+/** Freshness pre-pass budget inside a backfill run. A normal day's change set took ~2 min (36-45 pages) in 2026-11. */
+export const FRESHNESS_BUDGET_MS = 6 * 60_000;
+
+export type PhaseDecisionReason =
+  | 'backfill'                 // checkpoint already in the steady state
+  | 'delta_pinned'             // operator pin present and unexpired
+  | 'delta_unpinned_rearm'     // delta with no pin (how 2026-09-15 got stuck): re-arm
+  | 'delta_pin_expired_rearm'  // the pin's time has passed: re-arm
+  | 'delta_pin_invalid_rearm'; // unparseable or too-long pin: refuse it, re-arm
+
+/**
+ * Which phase this run uses. Pure; `nowMs` and the pin are explicit so the policy is testable.
+ *   backfill checkpoint                        -> backfill (resume its cursor)
+ *   delta + a pin that parses, is in the future,
+ *     and is at most DELTA_PIN_MAX_DAYS ahead  -> delta
+ *   delta otherwise                            -> backfill from the first page (re-arm)
+ * Nothing enters delta automatically any more: reaching the end of a backfill re-arms backfill, and the
+ * oversized-delta fallback moves delta -> backfill. So delta can never persist unless a person renews the pin.
+ */
+export function decideRunPhase(cp: Pick<Checkpoint, 'phase'>, nowMs: number, pinUntil: string | null | undefined): { phase: Phase; reason: PhaseDecisionReason } {
+  if (cp.phase !== 'delta') return { phase: 'backfill', reason: 'backfill' };
+  const raw = (pinUntil ?? '').trim();
+  if (!raw) return { phase: 'backfill', reason: 'delta_unpinned_rearm' };
+  const until = Date.parse(raw);
+  if (!Number.isFinite(until) || until - nowMs > DELTA_PIN_MAX_DAYS * 86_400_000) return { phase: 'backfill', reason: 'delta_pin_invalid_rearm' };
+  if (until <= nowMs) return { phase: 'backfill', reason: 'delta_pin_expired_rearm' };
+  return { phase: 'delta', reason: 'delta_pinned' };
 }
 
 export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResult> {
@@ -1042,6 +1096,17 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       throw new Error('ingest_checkpoints: delta phase without a watermark');
     }
 
+    /* PHASE POLICY (2026-11-06, MCP audit 2026-11-05). A delta checkpoint is honoured only under an explicit,
+       unexpired operator pin. Without one it re-arms to a full walk from the first page, BEFORE anything is
+       fetched, so the decision is durable even if this run then fails. The watermark and last_full_pass_at are
+       left untouched: re-arming claims nothing about what has been read. */
+    const checkpointPhase: Phase = cp.phase;
+    const decision = decideRunPhase(cp, runStartMs, opts.deltaPinUntil !== undefined ? opts.deltaPinUntil : process.env[DELTA_PIN_ENV]);
+    if (decision.phase !== cp.phase) {
+      cp = { ...cp, phase: decision.phase, cursor: null };
+      await store.saveCheckpoint(cp);
+      console.warn(`[ingest-mcp-registry] checkpoint phase=${checkpointPhase} re-armed to ${cp.phase} (${decision.reason}); last full pass ${cp.last_full_pass_at ?? 'never'}`);
+    }
     const phaseBefore: Phase = cp.phase;
     const updatedSince = phaseBefore === 'delta' ? cp.updated_since_watermark : null;
     const startCursor = phaseBefore === 'backfill' ? cp.cursor : null;
@@ -1088,8 +1153,8 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       console.log(
         `[ingest-mcp-registry] checkpoint #${checkpoints} ${kind} phase=${phaseBefore} items=${committed.fetched} ` +
         `filtered=${committed.filtered} upserted=${committed.upserted} snapshots=${committed.snapshots}` +
-        // cp.phase is always 'backfill' here (only a manual/operator action ever
-        // sets 'delta', and never inside this branch), so cursor=null always
+        // cp.phase is always 'backfill' here (delta needs an operator pin, see
+        // decideRunPhase, and never inside this branch), so cursor=null always
         // means "next read starts at the first page" — never "end of corpus".
         (phaseBefore === 'backfill' ? ` cursor=${cp.cursor ?? '(first page)'}` : ''),
       );
@@ -1114,13 +1179,53 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       return true;
     };
 
-    const walk = await walkRegistry({
-      progress, updatedSince, startCursor,
-      baseUrl: opts.baseUrl, timeoutMs: opts.timeoutMs,
-      deadlineMs: runStartMs + budgetMs,
-      segmentPages: opts.segmentPages, interPageDelayMs: opts.interPageDelayMs,
-      onFlush,
-    });
+    /* FRESHNESS PRE-PASS (2026-11-06). A full walk now spans several daily runs, and a backfill run alone would
+       only see a status change when its cursor reached that server (days late). So a backfill run that has a
+       watermark first reads ?updated_since=<watermark> under its own short budget, then resumes the cursor with
+       what is left. Rules:
+         complete  -> watermark advances to this run's anchor (the same rule a delta run uses)
+         budget    -> watermark kept; the cursor walk still runs, and the next pass's completion re-anchors it
+         registry / store -> the cursor walk is skipped; the run reports that stop exactly as before
+       It never touches the cursor, never stamps last_full_pass_at and never claims a complete corpus. Upserts are
+       idempotent and snapshots are written only on change, so a server read here and again by the walk in the same
+       run is not duplicated. */
+    let freshness: WalkResult | null = null;
+    const freshnessPages0 = progress.pages;
+    if (phaseBefore === 'backfill' && opts.freshnessDelta !== false && cp.updated_since_watermark) {
+      const freshFlush = async (items: MCPRegistryItem[]): Promise<boolean> => {
+        const committed = await commitItems(store, items, { completeCorpus: false, now: new Date().toISOString() });
+        totals.fetched += committed.fetched; totals.filtered += committed.filtered;
+        totals.upserted += committed.upserted; totals.snapshots += committed.snapshots;
+        totals.errors += committed.errors; totals.guardSkips += committed.versionGuardSkips;
+        for (const [k, n] of Object.entries(committed.statusTransitions)) transitions[k] = (transitions[k] ?? 0) + n;
+        if (!firstError && committed.firstError) firstError = committed.firstError;
+        return committed.errors === 0;
+      };
+      console.log(`[ingest-mcp-registry] freshness pre-pass updated_since=${cp.updated_since_watermark}`);
+      freshness = await walkRegistry({
+        progress, updatedSince: cp.updated_since_watermark, startCursor: null,
+        baseUrl: opts.baseUrl, timeoutMs: opts.timeoutMs,
+        deadlineMs: runStartMs + Math.min(budgetMs, opts.freshnessBudgetMs ?? FRESHNESS_BUDGET_MS),
+        segmentPages: opts.segmentPages, interPageDelayMs: opts.interPageDelayMs,
+        onFlush: freshFlush,
+      });
+      if (freshness.stop === 'complete') {
+        cp = { ...cp, updated_since_watermark: anchor() };
+        await store.saveCheckpoint(cp);
+      }
+      console.log(`[ingest-mcp-registry] freshness pre-pass stop=${freshness.stop} pages=${progress.pages - freshnessPages0}`);
+    }
+    const freshnessPages = progress.pages - freshnessPages0;
+
+    const walk: WalkResult = freshness && (freshness.stop === 'registry' || freshness.stop === 'store')
+      ? freshness
+      : await walkRegistry({
+        progress, updatedSince, startCursor,
+        baseUrl: opts.baseUrl, timeoutMs: opts.timeoutMs,
+        deadlineMs: runStartMs + budgetMs,
+        segmentPages: opts.segmentPages, interPageDelayMs: opts.interPageDelayMs,
+        onFlush,
+      });
 
     if (phaseBefore === 'delta') {
       if (walk.stop === 'complete') {
@@ -1182,7 +1287,7 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       servers_returned: totals.fetched,
       status:
         `${ingestErrors > 0 ? 'error' : walk.stop === 'complete' ? 'success' : 'checkpoint'} ` +
-        `phase=${phaseBefore}->${cp.phase} stop=${walk.stop}` + retryNote +
+        `phase=${phaseBefore}->${cp.phase} stop=${walk.stop}` + (freshness ? ` freshness=${freshness.stop}` : '') + retryNote +
         (walk.failure ? ` — ${walk.failure}` : '') +
         (cp.cursor ? ` resume_cursor=${cp.cursor}` : '') +
         (totals.guardSkips > 0 ? ` version_guard_skipped=${totals.guardSkips}` : ''),
@@ -1209,7 +1314,7 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
       itemsNew: totals.upserted - logged.upserted,
       metadata: {
         kind: 'run', run_started_at: startedAt.toISOString(), scan_run_id: scanRunId,
-        phase_before: phaseBefore, phase_after: cp.phase, stop: walk.stop, stop_detail: walk.failure,
+        phase_before: phaseBefore, phase_after: cp.phase, checkpoint_phase: checkpointPhase, phase_decision: decision.reason, freshness_stop: freshness?.stop ?? null, freshness_pages: freshnessPages, stop: walk.stop, stop_detail: walk.failure,
         updated_since: updatedSince, cursor_after: cp.cursor,
         watermark_after: cp.updated_since_watermark, last_full_pass_at: cp.last_full_pass_at,
         checkpoints, pages: progress.pages, run_fetched: totals.fetched, run_upserted: totals.upserted,
@@ -1235,7 +1340,7 @@ export async function ingestMCPRegistry(opts: RunOptions = {}): Promise<RunResul
     return {
       ...outcome,
       run_started_at: startedAt.toISOString(),
-      phase_before: phaseBefore, phase_after: cp.phase, stop: walk.stop, stop_detail: walk.failure,
+      phase_before: phaseBefore, phase_after: cp.phase, checkpoint_phase: checkpointPhase, phase_decision: decision.reason, freshness_stop: freshness?.stop ?? null, freshness_pages: freshnessPages, stop: walk.stop, stop_detail: walk.failure,
       pages: progress.pages, fetched: totals.fetched, filtered: totals.filtered,
       upserted: totals.upserted, snapshots: totals.snapshots, checkpoints,
       updated_since: updatedSince, cursor_after: cp.cursor,

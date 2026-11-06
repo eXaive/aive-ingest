@@ -39,6 +39,7 @@
 
 import { q, insertRows, endIngestPool } from '../lib/ingest/db';
 import { parseLimit } from '../lib/ingest/parseLimit';
+import { assertOutboundAllowed, SsrfBlockedError } from '../lib/net/ssrfGuard';
 
 const USER_AGENT =
   'AIVE-MCP-EndpointProbe/1.0 (+https://github.com/eXaive/aive-ingest; reachability check only, no auth attempted)';
@@ -226,6 +227,8 @@ export async function probeEndpoint(serverId: string, url: string): Promise<Prob
     const t0 = Date.now();
     let res: Response;
     try {
+      // SSRF guard: this hop's address (the original URL or a redirect target) must be contactable.
+      await assertOutboundAllowed(current, redirects);
       method = 'HEAD';
       res = await fetchOnce(current.href, 'HEAD');
       // HEAD → GET fallback only on 405 Method Not Allowed.
@@ -236,6 +239,15 @@ export async function probeEndpoint(serverId: string, url: string): Promise<Prob
         notes.push('HEAD returned 405; probed with GET');
       }
     } catch (err) {
+      if (err instanceof SsrfBlockedError) {
+        notes.push(err.message);
+        return {
+          ...base, error_class: 'other', redirect_target: redirectTarget,
+          note: notes.join('; ').slice(0, 400),
+          // NULL = no request was sent for the original URL; a refused redirect still records what was sent.
+          probe_method: err.hop === 0 ? null : method,
+        };
+      }
       const { cls, tls, raw } = classifyException(err);
       if (cls === 'other') notes.push(raw.slice(0, 200));
       return {

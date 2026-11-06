@@ -31,6 +31,10 @@
 import Module from 'node:module';
 import path from 'node:path';
 import { isExcluded, exclusionNote, type ExclusionSet, type Exclusion } from '../lib/mcp/exclusions';
+import { setSsrfTestPolicy } from '../lib/net/ssrfGuard';
+// Fixtures use loopback servers and .invalid hosts. The SSRF guard (lib/net/ssrfGuard.ts) refuses both in
+// production; this verifier exercises the collector, not the guard (scripts/verify-ssrf-guard.ts covers that).
+setSsrfTestPolicy({ allowLoopback: true, lookup: async (host) => (host === 'localhost' ? ['127.0.0.1'] : ['93.184.216.34']) });
 
 /* ── reporting ───────────────────────────────────────────────────────────── */
 const fails: string[] = [];
@@ -191,6 +195,10 @@ const fakeDb = {
   async logIngestionPg(): Promise<void> { /* not under test */ },
   async upsertRows(): Promise<void> { throw new Error('db double: upsertRows not expected'); },
   async withRollback(): Promise<void> { throw new Error('db double: withRollback not expected'); },
+  // lib/ingest/db.ts connection-budget helpers (2026-11-06). The double has no connection limit, so they pass
+  // straight through; their own contract is scripts/verify-connection-budget.ts.
+  async withConnectionLimitRetry<T>(fn: () => Promise<T>): Promise<T> { return fn(); },
+  async connectWithRetry() { return fakeDb.ingestPool().connect(); },
 };
 
 /**

@@ -1,0 +1,271 @@
+{
+  "schema": "aive.protocol-watch-sources.v1",
+  "reviewedOn": "2026-11-06",
+  "sources": [
+    {
+      "sourceId": "github:a2aproject/a2a",
+      "protocolId": "a2a",
+      "method": "GITHUB_REPOSITORY",
+      "target": "a2aproject/A2A",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:a2ui-project/a2ui",
+      "protocolId": "a2ui",
+      "method": "GITHUB_REPOSITORY",
+      "target": "a2ui-project/a2ui",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:ag-ui-protocol/ag-ui",
+      "protocolId": "ag-ui",
+      "method": "GITHUB_REPOSITORY",
+      "target": "ag-ui-protocol/ag-ui",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agent-network-protocol/agentnetworkprotocol",
+      "protocolId": "anp",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agent-network-protocol/AgentNetworkProtocol",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agentic-commerce-protocol/agentic-commerce-protocol",
+      "protocolId": "openai-agentic-commerce",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agentic-commerce-protocol/agentic-commerce-protocol",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agentnameservice/ans-spec",
+      "protocolId": "agent-passports",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agentnameservice/ans-spec",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agntcy/dir",
+      "protocolId": "agntcy",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agntcy/dir",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agntcy/oasf",
+      "protocolId": "agntcy",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agntcy/oasf",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agntcy/observe",
+      "protocolId": "agntcy-observe",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agntcy/observe",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agntcy/slim",
+      "protocolId": "slim",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agntcy/slim",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:agntcy/slim-spec",
+      "protocolId": "slim",
+      "method": "GITHUB_REPOSITORY",
+      "target": "agntcy/slim-spec",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:aidecentralized/nanda-quilt-of-registries-and-verified-agentfacts",
+      "protocolId": "nanda",
+      "method": "GITHUB_REPOSITORY",
+      "target": "aidecentralized/NANDA-Quilt-of-Registries-and-Verified-AgentFacts",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:ards-project/ard-spec",
+      "protocolId": "ard",
+      "method": "GITHUB_REPOSITORY",
+      "target": "ards-project/ard-spec",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:google-agentic-commerce/ap2",
+      "protocolId": "ap2",
+      "method": "GITHUB_REPOSITORY",
+      "target": "google-agentic-commerce/AP2",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:modelcontextprotocol/modelcontextprotocol",
+      "protocolId": "mcp",
+      "method": "GITHUB_REPOSITORY",
+      "target": "modelcontextprotocol/modelcontextprotocol",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:modelcontextprotocol/registry",
+      "protocolId": "mcp",
+      "method": "GITHUB_REPOSITORY",
+      "target": "modelcontextprotocol/registry",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:nlweb-ai/nlweb",
+      "protocolId": "nlweb",
+      "method": "GITHUB_REPOSITORY",
+      "target": "nlweb-ai/NLWeb",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:open-telemetry/semantic-conventions",
+      "protocolId": "opentelemetry",
+      "method": "GITHUB_REPOSITORY",
+      "target": "open-telemetry/semantic-conventions",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:open-telemetry/semantic-conventions-genai",
+      "protocolId": "opentelemetry",
+      "method": "GITHUB_REPOSITORY",
+      "target": "open-telemetry/semantic-conventions-genai",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:projnanda/nanda-index-v2",
+      "protocolId": "nanda",
+      "method": "GITHUB_REPOSITORY",
+      "target": "projnanda/nanda-index-v2",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:universal-commerce-protocol/ucp",
+      "protocolId": "ucp",
+      "method": "GITHUB_REPOSITORY",
+      "target": "Universal-Commerce-Protocol/ucp",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:webmachinelearning/webmcp",
+      "protocolId": "webmcp",
+      "method": "GITHUB_REPOSITORY",
+      "target": "webmachinelearning/webmcp",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "github:x402-foundation/x402",
+      "protocolId": "x402",
+      "method": "GITHUB_REPOSITORY",
+      "target": "x402-foundation/x402",
+      "gate": "ALLOWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "ietf:draft-mp-agntcy-ads",
+      "protocolId": "agntcy",
+      "method": "IETF_DRAFT",
+      "target": "draft-mp-agntcy-ads",
+      "gate": "ALLOWED",
+      "freshnessHours": 168
+    },
+    {
+      "sourceId": "ietf:draft-mpsb-agntcy-slim",
+      "protocolId": "slim",
+      "method": "IETF_DRAFT",
+      "target": "draft-mpsb-agntcy-slim",
+      "gate": "ALLOWED",
+      "freshnessHours": 168
+    },
+    {
+      "sourceId": "registry:a2aregistry-org",
+      "protocolId": "a2a",
+      "method": "REGISTRY_API",
+      "target": "https://a2aregistry.org/api/stats",
+      "gate": "BLOCKED_PHASE3",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:allagents",
+      "protocolId": "a2a",
+      "method": "REGISTRY_API",
+      "target": "https://allagents.app/api/agents",
+      "gate": "BLOCKED_TERMS_NOT_REVIEWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:bazaar-cdp",
+      "protocolId": "x402",
+      "method": "REGISTRY_API",
+      "target": "https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources",
+      "gate": "BLOCKED_PHASE3",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:bazaar-payai",
+      "protocolId": "x402",
+      "method": "REGISTRY_API",
+      "target": "https://facilitator.payai.network/discovery/resources",
+      "gate": "BLOCKED_PHASE3",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:godaddy-ans",
+      "protocolId": "agent-passports",
+      "method": "REGISTRY_API",
+      "target": "https://api.godaddy.com/v1/agents",
+      "gate": "BLOCKED_CREDENTIALS_REQUIRED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:mcp-official-registry",
+      "protocolId": "mcp",
+      "method": "REGISTRY_API",
+      "target": "https://registry.modelcontextprotocol.io/v0.1/servers",
+      "gate": "COVERED_BY_EXISTING_COLLECTOR",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:oasf-schema",
+      "protocolId": "agntcy",
+      "method": "REGISTRY_API",
+      "target": "https://schema.oasf.outshift.com/api/version",
+      "gate": "BLOCKED_TERMS_NOT_REVIEWED",
+      "freshnessHours": 48
+    },
+    {
+      "sourceId": "registry:outshift-directory",
+      "protocolId": "agntcy",
+      "method": "REGISTRY_API",
+      "target": "https://agent-directory.outshift.com/",
+      "gate": "BLOCKED_TERMS_NOT_REVIEWED",
+      "freshnessHours": 48
+    }
+  ],
+  "version": "003de52913f158ba929ed341dd8f1e8102694c4495f1708baa5b3b5cda6be26e"
+}

@@ -1,0 +1,78 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Protocol Watch — Protocol Intelligence, Phase 2 (2026-11-06).
+#
+# ONE shared, bounded watch over the reviewed protocol source catalogue
+# (config/protocol-watch-sources.v1.json, exported from the platform's
+# lib/protocols/protocolWatchCatalogue.ts): GitHub releases/tags/repository
+# state for the official protocol repositories and IETF Internet-Draft
+# revisions. Not 17 jobs. Registries, documents, Agent Cards and x402 service
+# endpoints are NEVER fetched by this workflow.
+#
+# ▶ DISABLED BY DEFAULT. The job runs only when the repository variable
+#   PROTOCOL_WATCH_ENABLED is exactly 'true' (Settings → Variables). Until the
+#   owner approves monitoring AND the migration proposal
+#   protocol-watch-evidence-v1 is applied, scheduled runs show as skipped and
+#   cost nothing. The worker also refuses write mode without the same flag and
+#   preflights the evidence tables.
+#
+# Own concurrency group, pool 1 (amendment 1): never in the shared aive-ingest-db lane.
+#
+# CRON 01:15Z and 13:15Z: 12-hour slots, clear of the 03:00Z–07:00Z ingest
+# block. About 70 GitHub requests and 2 Datatracker requests per run, well under
+# the Actions token's 1,000/hour; the worker stops GitHub requests below a
+# remaining-quota floor and never retries a 404/410.
+#
+# Triggers: schedule + workflow_dispatch ONLY. No push / pull_request /
+# pull_request_target: this is a PUBLIC repo and the job holds a database
+# credential.
+#
+# Required repo secret (only when enabled): AIVE_INGEST_DATABASE_URL (scoped
+# aive_ingest role). GITHUB_TOKEN is the Actions-provided token; no PAT.
+# ═══════════════════════════════════════════════════════════════════════════
+name: Protocol Watch
+
+on:
+  schedule:
+    - cron: '15 1,13 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: protocol-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    if: ${{ vars.PROTOCOL_WATCH_ENABLED == 'true' }}
+    # SINGLE LANE (amendment 1, 2026-11-06), NOT the shared aive-ingest-db lane. A GitHub concurrency group holds one
+    # running + one pending job and a newer pending job CANCELS the older one, silently (cancelled runs do not alert).
+    # Replaying 14 days of real lane history with this job added at every cron drift from 0 to 8 h: in the shared lane it
+    # lost up to 6 of 29 runs AND displaced up to 5 existing MCP lane runs; in its own group with pool 1 it caused
+    # 0 cancellations, peak 4 connections (the role limit, never above). Excess is refused at connect (53300) and
+    # retried by lib/ingest/db.ts before any statement. Contract: scripts/verify-connection-topology.ts (single lane).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Protocol watch
+        env:
+          PROTOCOL_WATCH_MODE: write
+          PROTOCOL_WATCH_ENABLED: ${{ vars.PROTOCOL_WATCH_ENABLED }}
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          AIVE_INGEST_POOL_MAX: '1'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx tsx workers/protocol-watch.ts

@@ -35,6 +35,10 @@ import http from 'node:http';
 import {
   HostScheduler, runSweep, discoverOnce, type Item, type Outcome, type DiscoverRow,
 } from '../workers/discover-mcp-servers';
+import { setSsrfTestPolicy } from '../lib/net/ssrfGuard';
+// Fixtures use loopback servers and .invalid hosts. The SSRF guard (lib/net/ssrfGuard.ts) refuses both in
+// production; this verifier exercises the collector, not the guard (scripts/verify-ssrf-guard.ts covers that).
+setSsrfTestPolicy({ allowLoopback: true, lookup: async (host) => (host === 'localhost' ? ['127.0.0.1'] : ['93.184.216.34']) });
 
 const fails: string[] = [];
 const check = (label: string, pass: boolean, detail = '') => {
