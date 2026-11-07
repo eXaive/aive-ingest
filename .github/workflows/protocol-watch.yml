@@ -68,7 +68,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # M1 trial guard (2026-11-06): a repository variable never expires, so every run first checks the explicit
+      # trial window (vars.PROTOCOL_WATCH_TRIAL_UNTIL, ISO-8601 UTC, at most 15 days ahead) and the latching stop rules
+      # in lib/protocolWatch/trialGuard.ts against the run receipts. Fail-closed: no window => no collection. It reads
+      # only protocol_watch_runs, closes its single connection before the worker opens one (peak stays 1).
+      - name: Trial guard
+        id: guard
+        env:
+          PROTOCOL_WATCH_TRIAL_UNTIL: ${{ vars.PROTOCOL_WATCH_TRIAL_UNTIL }}
+          PROTOCOL_WATCH_TRIAL_ACK: ${{ vars.PROTOCOL_WATCH_TRIAL_ACK }}
+          AIVE_INGEST_DATABASE_URL: ${{ secrets.AIVE_INGEST_DATABASE_URL }}
+          AIVE_INGEST_POOL_MAX: '1'
+        run: npx tsx scripts/protocol-watch-trial-guard.ts
+
       - name: Protocol watch
+        if: steps.guard.outputs.proceed == 'true'
         env:
           PROTOCOL_WATCH_MODE: write
           PROTOCOL_WATCH_ENABLED: ${{ vars.PROTOCOL_WATCH_ENABLED }}

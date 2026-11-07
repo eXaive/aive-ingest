@@ -51,6 +51,7 @@
     "verify:failure-alert": "tsx scripts/verify-failure-alert.ts",
     "verify:watch-evaluation-trigger": "tsx scripts/verify-watch-evaluation-trigger.ts",
     "verify:protocol-watch": "tsx scripts/verify-protocol-watch.ts",
+    "verify:protocol-watch-trial-guard": "tsx scripts/verify-protocol-watch-trial-guard.ts",
     "watch:protocols": "tsx workers/protocol-watch.ts"
   },
   "dependencies": {

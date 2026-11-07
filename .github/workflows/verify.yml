@@ -100,6 +100,8 @@ jobs:
         run: npm run verify:connection-topology
       - name: verify:protocol-watch
         run: npm run verify:protocol-watch
+      - name: verify:protocol-watch-trial-guard
+        run: npm run verify:protocol-watch-trial-guard
       - name: verify:tool-collection-evidence
         run: npm run verify:tool-collection-evidence
       - name: verify:list-collectors
