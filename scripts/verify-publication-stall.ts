@@ -24,7 +24,7 @@ require.cache[dbPath] = { id: dbPath, filename: dbPath, loaded: true, exports: {
 
 // Required (not imported) so they load after the fake database above.
 const { stalledAttemptMessage, STALL_AFTER_MS } = require('../lib/broadcast/publicationAttempts') as typeof import('../lib/broadcast/publicationAttempts');
-const { DAILY_POSTING_ACCOUNTS, POSTED_LAST_24H_SQL, postedNothingAccounts, postedNothingMessage } = require('../lib/broadcast/dailyPostingAccounts') as typeof import('../lib/broadcast/dailyPostingAccounts');
+const { DAILY_POSTING_ACCOUNTS, PAUSED_POSTING_ACCOUNTS, POSTED_LAST_24H_SQL, postedNothingAccounts, postedNothingMessage, pausedAccountsNote } = require('../lib/broadcast/dailyPostingAccounts') as typeof import('../lib/broadcast/dailyPostingAccounts');
 
 async function main() {
   // 1. Stall rule.
@@ -55,13 +55,24 @@ async function main() {
   const byHandle = Object.fromEntries(DAILY_POSTING_ACCOUNTS.map(a => [a.handle, a.accountId]));
   assert.ok(daily.includes(`const MISTER_MCP_A2A = '${byHandle['mr.agent.infrastructure']}'`) && text.includes(`const MISTER_MCP_A2A = '${byHandle['mr.agent.infrastructure']}'`));
   assert.ok(quiz.includes(`accountId: '${byHandle['vice.marshal.kyli']}', // vice.marshal.kyli`));
-  assert.ok(quiz.includes(`accountId: '${byHandle['wwwsnowbunnymafiacom']}', // wwwsnowbunnymafiacom`));
+  // Both active TikTok accounts stay monitored; Cat is paused, not forgotten: its id still matches the worker constant.
+  assert.deepEqual(DAILY_POSTING_ACCOUNTS.map(a => a.handle), ['mr.agent.infrastructure', 'vice.marshal.kyli']);
+  const cat = PAUSED_POSTING_ACCOUNTS.find(a => a.handle === 'wwwsnowbunnymafiacom')!;
+  assert.ok(cat && cat.status === 'PAUSED / DISCONNECTED', 'Cat is recorded as PAUSED / DISCONNECTED');
+  assert.ok(quiz.includes(`accountId: '${cat.accountId}', // wwwsnowbunnymafiacom`));
+  assert.ok(!PAUSED_POSTING_ACCOUNTS.some(p => DAILY_POSTING_ACCOUNTS.some(a => a.accountId === p.accountId)), 'an account is either monitored or paused, never both');
   assert.match(POSTED_LAST_24H_SQL, /state = 'confirmed_published' and confirmed_at >= now\(\) - interval '24 hours'/);
-  const none = postedNothingAccounts([{ account_id: byHandle['mr.agent.infrastructure'], n: 2 }, { account_id: byHandle['vice.marshal.kyli'], n: 3 }]);
-  assert.deepEqual(none.map(a => a.handle), ['wwwsnowbunnymafiacom']);
-  assert.equal(postedNothingMessage(none), 'POSTED_NOTHING_24H: wwwsnowbunnymafiacom (fed by Broadcast Quiz Card (Cat)) had 0 confirmed posts in the last 24 hours');
+  // A real stall on an active account still alarms, by name.
+  const none = postedNothingAccounts([{ account_id: byHandle['mr.agent.infrastructure'], n: 2 }]);
+  assert.deepEqual(none.map(a => a.handle), ['vice.marshal.kyli']);
+  assert.equal(postedNothingMessage(none), 'POSTED_NOTHING_24H: vice.marshal.kyli (fed by Broadcast Quiz Card (GTA)) had 0 confirmed posts in the last 24 hours');
+  const both = postedNothingAccounts([]);
+  assert.equal(postedNothingMessage(both), 'POSTED_NOTHING_24H: mr.agent.infrastructure (fed by Broadcast Daily Post + Broadcast Text Card); vice.marshal.kyli (fed by Broadcast Quiz Card (GTA)) had 0 confirmed posts in the last 24 hours');
+  // The paused account posting nothing does not alarm while the active accounts post.
+  assert.equal(postedNothingMessage(postedNothingAccounts([...DAILY_POSTING_ACCOUNTS.map(a => ({ account_id: a.accountId, n: 1 })), { account_id: cat.accountId, n: 0 }])), null);
   assert.equal(postedNothingMessage(postedNothingAccounts(DAILY_POSTING_ACCOUNTS.map(a => ({ account_id: a.accountId, n: 1 })))), null);
-  console.log('PASS daily accounts: ids match the worker constants; 0 confirmed posts in 24 h names the account');
+  assert.equal(pausedAccountsNote(), 'PAUSED_NOT_MONITORED: wwwsnowbunnymafiacom (Broadcast Quiz Card (Cat)) PAUSED / DISCONNECTED since 2026-11-08');
+  console.log('PASS daily accounts: ids match the worker constants; an active account with 0 confirmed posts in 24 h is named; the paused Cat account is reported, not alarmed');
 
   // 4. Reconciler behaviour: confirms a published post, then reports the silent account; GET reads only.
   process.env.BLOTATO_API_KEY = 'offline-test-key';
@@ -70,16 +81,19 @@ async function main() {
     return new Response(JSON.stringify({ status: 'published', publicUrl: 'https://www.tiktok.com/@wwwsnowbunnymafiacom' }), { status: 200 }); }) as typeof fetch;
   const { main: reconcile } = require('../workers/reconcile-broadcast-publications');
   candidates = [{ id: 'f578909f', provider_submission_id: '76777274' }];
-  posted24h = [{ account_id: byHandle['mr.agent.infrastructure'], n: 3 }, { account_id: byHandle['vice.marshal.kyli'], n: 3 }];
+  posted24h = [{ account_id: byHandle['mr.agent.infrastructure'], n: 3 }];
+  const logged: string[] = [], log = console.log; console.log = (...a: unknown[]) => { logged.push(a.join(' ')); };
   const failure = await reconcile();
+  console.log = log;
+  assert.ok(logged.includes(pausedAccountsNote()!), 'each run names the paused account');
   assert.ok(calls.some(c => /confirm_broadcast_publication/.test(c.text) && (c.params as unknown[])[0] === 'f578909f'), 'published post confirmed');
   assert.deepEqual(fetched, ['GET https://backend.blotato.com/v2/posts/76777274'], 'status read only, no provider create call');
   assert.deepEqual((calls.find(c => /count\(\*\)::int as n/.test(c.text))!.params as unknown[][])[0], DAILY_POSTING_ACCOUNTS.map(a => a.accountId));
-  assert.match(failure, /^POSTED_NOTHING_24H: wwwsnowbunnymafiacom /);
+  assert.match(failure, /^POSTED_NOTHING_24H: vice\.marshal\.kyli \(fed by Broadcast Quiz Card \(GTA\)\) had 0/);
   posted24h = DAILY_POSTING_ACCOUNTS.map(a => ({ account_id: a.accountId, n: 1 })); candidates = [];
   assert.equal(await reconcile(), null, 'every account posted: run succeeds');
   assert.match(src('workers/reconcile-broadcast-publications.ts'), /main\(\)\.then\(async failure=>\{await endIngestPool\(\);if\(failure\)\{console\.error\(failure\);process\.exit\(1\)\}\}\)/);
-  console.log('PASS reconciler: confirms published posts (GET only), then exits non-zero naming any account silent for 24 h');
+  console.log('PASS reconciler: confirms published posts (GET only), names paused accounts, then exits non-zero naming any active account silent for 24 h');
 
   // 5. Hourly schedule and failure-alert coverage.
   const wf = src('.github/workflows/broadcast-reconcile.yml');
